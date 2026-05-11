@@ -8,11 +8,14 @@ import {
   resolveFraudAlertTool,
   listSessionsTool,
   revokeSessionTool,
-  sendOtpTool,
-  verifyOtpTool,
+
+  sendPhoneVerificationOtpTool,
+  verifyPhoneVerificationOtpTool,
+
   auditLogTool,
 } from "../tools/index.js";
 import { bankingWorkspace } from "../workspace.js";
+import { TokenLimiterProcessor } from "@mastra/core/processors";
 
 const bankName = process.env.BANK_NAME || "First Bank Nigeria";
 const supportPhone = process.env.SUPPORT_PHONE || "+2348001234567";
@@ -101,13 +104,27 @@ export const securityAgent = new Agent({
     resolveFraudAlertTool,
     listSessionsTool,
     revokeSessionTool,
-    sendOtpTool,
-    verifyOtpTool,
+
+    sendPhoneVerificationOtpTool,
+    verifyPhoneVerificationOtpTool,
+    
     auditLogTool,
   },
   memory: new Memory({
     storage: sharedPgStore,
     options: { lastMessages: 25, generateTitle: false },
   }),
+
+  inputProcessors: [
+    new TokenLimiterProcessor({ limit: 4000 }),
+  ],
+  outputProcessors: [
+    // limit response length
+    new TokenLimiterProcessor({
+      limit: 1500,
+      strategy: 'truncate',
+      countMode: 'cumulative',
+    }),
+  ],
   workspace: bankingWorkspace,
 });

@@ -14,14 +14,22 @@ const projectRoot = path.resolve(__dirname, "../../");
  * - LocalSandbox: Execute shell commands for administrative tasks
  * - Skills: All skills under the /skills directory are available to agents
  */
+
 export const bankingWorkspace = new Workspace({
   filesystem: new LocalFilesystem({
     basePath: path.join(projectRoot, "workspace"),
   }),
+
   sandbox: new LocalSandbox({
     workingDirectory: path.join(projectRoot, "workspace"),
   }),
-  skills: [
-    path.join(projectRoot, "skills"),
-  ],
+
+  // ✅ REQUIRED for SKILL.md system
+  skills: ["skills"],
+
+  // (optional but recommended for large banking flows)
+  bm25: true,
+
+  // (optional) improves skill + doc discovery
+  autoIndexPaths: ["skills"],
 });

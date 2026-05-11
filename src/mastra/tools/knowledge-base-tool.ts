@@ -118,7 +118,7 @@ export const knowledgeBaseTool = createTool({
         : `No relevant content found in the knowledge base for this query. ` +
           `Do NOT guess or fabricate an answer. ` +
           `Options: (1) rephrase the query and try again, ` +
-          `(2) acknowledge you don't have that information and create an escalation ticket, ` +
+          `(2) acknowledge you don't have that information and request to create an escalation ticket, ` +
           `(3) direct the customer to the support line.`;
 
       console.log(`[KnowledgeBaseTool] Found=${found} results=${allResults.length}`);

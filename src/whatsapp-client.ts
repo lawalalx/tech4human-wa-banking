@@ -119,3 +119,16 @@ export async function sendWhatsAppList(
   });
   return ok;
 }
+
+export async function sendWhatsAppImage(to: string, imageUrl: string, caption?: string): Promise<boolean> {
+  const { ok } = await post({
+    messaging_product: "whatsapp",
+    to,
+    type: "image",
+    image: {
+      link: imageUrl,
+      ...(caption ? { caption } : {}),
+    },
+  });
+  return ok;
+}

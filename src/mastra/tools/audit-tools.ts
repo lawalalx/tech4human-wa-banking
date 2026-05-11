@@ -27,7 +27,7 @@ export const auditLogTool = createTool({
     agentId: z.string().optional().describe("The agent that triggered this event"),
     inputSummary: z.string().optional().describe("Sanitised summary of input (no PII)"),
     outputSummary: z.string().optional().describe("Sanitised summary of output"),
-    metadata: z.record(z.unknown()).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   }),
   outputSchema: z.object({
     logged: z.boolean(),

@@ -4,7 +4,6 @@ import { callBankingTool } from "../core/mcp/banking-mcp-client.js";
 import { randomUUID } from "crypto";
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
-
 interface AccountSummary {
   account_number: string;
   account_number_masked: string;
@@ -18,13 +17,122 @@ interface AccountSummary {
 //   2. Exactly one account  → resolved, proceed
 //   3. Multiple accounts    → ask customer which account to use
 
+
+// create a lookup tool to find the customer's account(s) based on their phone number. This will be used by balance enquiry, mini statement, and transfer tools to resolve the correct account.
+export const lookupCustomerByPhoneTool = createTool({
+  id: "lookup_customer_by_phone",
+  description:
+    "Look up the SENDER/CUSTOMER's account(s) based on their WhatsApp phone number. " +
+    "ALWAYS use the phone from the system context message ('Customer phone: +234XXXXXXXXXX'). " +
+    "NEVER call this with an account number. NEVER ask the customer for their phone. " +
+    "Returns whether the phone is registered, the associated customer ID, and whether a transaction PIN is set. " +
+    "This tool is used as the first step in all transaction flows to resolve the customer's account and PIN status.",
+  inputSchema: z.object({
+    phone: z.string().describe("Customer's WhatsApp phone number"),
+  }),
+  outputSchema: z.object({
+    found: z.boolean(),
+    customerId: z.number().optional(),
+    hasPin: z.boolean().optional(),
+    message: z.string().optional(),
+  }),
+  execute: async ({ phone }: { phone: string }) => {
+    const result = await callBankingTool<{
+      found: boolean;
+      customer_id?: number;
+      has_pin?: boolean;
+      message?: string;
+    }>("lookup_customer_by_phone", { phone_number: phone });
+
+    return {
+      found: result.found ?? false,
+      customerId: result.customer_id,
+      hasPin: result.has_pin ?? false,
+      message: result.found ? undefined : result.message,
+    };
+  },
+});
+
+
+// async def lookup_customer_by_account(account_number: str, bank_code: str) -> LookupCustomerByAccountResponse:
+// Look up customer destils by accountnumber and bank_code
+export const lookupCustomerByAccountTool = createTool({
+  id: "lookup-customer-by-account",
+  description:
+    "Look up RECIPIENT/DESTINATION account details by account number. " +
+    "ONLY use this to verify a transfer recipient — NOT for the sender/customer. " +
+    "NEVER pass a phone number to this tool — it requires an actual bank account number. " +
+    "Returns whether the account exists, the associated account name, bank name, and customer ID. " +
+    "This tool is used to verify recipient details before executing interbank transfers.",
+  inputSchema: z.object({
+    accountNumber: z.string().describe("The destination account number to look up"),
+  }),
+  outputSchema: z.object({
+    found: z.boolean(),
+    accountName: z.string().optional(),
+    customerId: z.number().optional(),
+    message: z.string().optional(),
+    bankName: z.string().optional(),
+  }),
+  execute: async ({ accountNumber }: { accountNumber: string }) => {
+    const result = await callBankingTool<{
+      found: boolean;
+      customer_name?: string;
+      customer_id?: number;
+      message?: string;
+      bank_name?: string;
+    }>("lookup_customer_by_account", { account_number: accountNumber });
+
+    return {
+      found: result.found ?? false,
+      accountName: result.customer_name ?? undefined,
+      customerId: result.customer_id,
+      message: result.found ? undefined : result.message,
+      bankName: result.bank_name ?? undefined
+    };
+  },
+});
+
+
+// )async def generate_receipt(reference: str) -> ReceiptResponse:
+// create a tool to generate a transaction receipt based on a transaction reference. This can be used after executing a transfer to provide the customer with a receipt of their transaction.
+export const generateReceiptTool = createTool({
+  id: "generate-receipt",
+  description:
+    "Generate a transaction receipt based on a transaction reference. " +
+    "Returns the receipt details including amount, date, masked account number, and transaction status. " +
+    "This tool is used after executing a transfer to provide the customer with a receipt of their transaction.",
+  inputSchema: z.object({
+    reference: z.string().describe("The transaction reference for which to generate the receipt"),
+  }),
+  outputSchema: z.object({
+    success: z.boolean(),
+    receiptText: z.string(),
+    message: z.string(),
+  }),
+  execute: async ({ reference }: { reference: string }) => {
+    const result = await callBankingTool<{
+      success: boolean;
+      receipt_text: string;
+      message: string;
+    }>("generate_receipt", { reference });
+
+    return {
+      success: result.success,
+      receiptText: result.receipt_text,
+      message: result.message,
+    };
+  },
+});
+
+
 export const resolveCustomerAccountTool = createTool({
   id: "resolve-customer-account",
   description:
-    "Look up the bank account(s) associated with a phone number. " +
+    "Look up the bank account(s) associated with the SENDER's phone number. " +
+    "ALWAYS pass the phone from the system context message ('Customer phone: +234XXXXXXXXXX'). " +
     "Call this FIRST before any balance, statement, transfer or insights tool. " +
-    "If the phone is not registered, it prompts the agent to ask for the registered number " +
-    "and advise the customer to link their WhatsApp number. " +
+    "If the phone is not registered, it prompts the agent to advise the customer to link their WhatsApp number. " +
     "If the customer has multiple accounts, it returns all masked accounts so the agent " +
     "can ask which one to use.",
   inputSchema: z.object({

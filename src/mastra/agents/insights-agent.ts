@@ -8,8 +8,10 @@ import {
   creditScoreTool,
   setBudgetTool,
   auditLogTool,
+  transactionChartTool,
 } from "../tools/index.js";
 import { bankingWorkspace } from "../workspace.js";
+import { TokenLimiterProcessor } from "@mastra/core/processors";
 
 const bankName = process.env.BANK_NAME || "First Bank Nigeria";
 
@@ -48,7 +50,41 @@ export const insightsAgent = new Agent({
   2. Use get-spending-summary tool.
   3. Format breakdown by category with amounts and percentages.
   4. Include net savings calculation.
-  5. Offer to set up savings automatic transfer if surplus exists.
+  5. ALWAYS offer to visualise as a chart:
+     "Would you like to see this as a chart? Reply *chart*, *pie*, *bar*, or *line* to visualise it! 📊"
+
+  ## TRANSACTION CHARTS & ANALYTICS (US-010b)
+  When the customer asks to "show a chart", "see my spending visually", "graph", "trend",
+  "trend line", or any visual representation of their transactions:
+
+  MANDATORY STEPS — you MUST follow all of them, no shortcuts:
+
+  1. Call 'get-spending-summary' with the customer's phone number to get categorised transaction data.
+     Use period="this_month" by default, or the period the customer specified.
+     If the tool returns an error or empty categories, still proceed to step 2 with whatever
+     transaction data is available — do NOT abandon and do NOT make up stories about saving files.
+
+  2. Determine chart type:
+     - "by category" / "breakdown" / "pie" → chartType: "pie"
+     - "trend" / "over time" / "line" / "trend line" → chartType: "line"
+     - Default or "bar" / "bar chart" → chartType: "bar"
+
+  3. IMMEDIATELY call 'generate-transaction-chart' with:
+     - transactions: the array of transactions from step 1 (map each category to a transaction
+       object: { date: "now", amount: category.total, description: category.category })
+     - chartType: the type determined in step 2
+
+  4. If success=true:
+     - Wrap the chartUrl EXACTLY like this (no spaces inside the tag):
+       <chart_url>https://quickchart.io/chart?c=...</chart_url>
+     - Put the <chart_url> tag FIRST, then the summary text as the message body.
+     - The platform renders the URL as a native WhatsApp image — do NOT write the raw URL anywhere else.
+
+  5. If success=false: Show the text summary returned by the tool. NEVER tell the customer to use
+     Excel, Google Sheets, or any external tool. NEVER claim to save data to a JSON file.
+
+  ⚠️ CRITICAL: You MUST call the 'generate-transaction-chart' tool every time a chart is requested.
+  Telling the customer to use external software is FORBIDDEN. Claiming to save data to a file is FORBIDDEN.
 
   ## SAVINGS RECOMMENDATIONS (US-011)
   Analyse trends and recommend:
@@ -86,10 +122,23 @@ export const insightsAgent = new Agent({
     creditScoreTool,
     setBudgetTool,
     auditLogTool,
+    transactionChartTool,
   },
   memory: new Memory({
     storage: sharedPgStore,
     options: { lastMessages: 15, generateTitle: false },
   }),
+
+  inputProcessors: [
+    new TokenLimiterProcessor({ limit: 4000 }),
+  ],
+  outputProcessors: [
+    // limit response length
+    new TokenLimiterProcessor({
+      limit: 1500,
+      strategy: 'truncate',
+      countMode: 'cumulative',
+    }),
+  ],
   workspace: bankingWorkspace,
 });

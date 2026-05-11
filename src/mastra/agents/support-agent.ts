@@ -11,6 +11,7 @@ import {
 } from "../tools/index.js";
 import { bankingWorkspace } from "../workspace.js";
 import { deleteTicketTool } from "../tools/support-tools.js";
+import { TokenLimiterProcessor } from "@mastra/core/processors";
 
 const bankName = process.env.BANK_NAME || "First Bank Nigeria";
 const supportPhone = process.env.SUPPORT_PHONE || "+2348001234567";
@@ -193,5 +194,17 @@ export const supportAgent = new Agent({
     storage: sharedPgStore,
     options: { lastMessages: 20, generateTitle: false },
   }),
+
+  inputProcessors: [
+    new TokenLimiterProcessor({ limit: 4000 }),
+  ],
+  outputProcessors: [
+    // limit response length
+    new TokenLimiterProcessor({
+      limit: 1500,
+      strategy: 'truncate',
+      countMode: 'cumulative',
+    }),
+  ],
   workspace: bankingWorkspace,
 });

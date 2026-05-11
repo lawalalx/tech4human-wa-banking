@@ -13,7 +13,8 @@ export async function extractText(filePath: string, originalName?: string): Prom
 
   if (ext === "pdf") {
     // pdf-parse uses CommonJS — dynamic import handles ESM interop
-    const pdfParse = (await import("pdf-parse")).default;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pdfParse = ((await import("pdf-parse")) as any).default;
     const buffer = await fs.readFile(filePath);
     const result = await pdfParse(buffer);
     return result.text;
@@ -51,7 +52,7 @@ export async function extractText(filePath: string, originalName?: string): Prom
     const lines: string[] = [];
     for (const sheetName of workbook.SheetNames) {
       const sheet = workbook.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" }) as Record<string, unknown>[];
       for (const row of rows) {
         lines.push(Object.values(row).join(" "));
       }

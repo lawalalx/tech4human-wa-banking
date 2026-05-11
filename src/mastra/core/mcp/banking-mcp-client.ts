@@ -74,6 +74,9 @@ export async function callBankingTool<T = unknown>(
 ): Promise<T> {
   const toolsets = await getBankingMcpToolsets();
   const serverTools = toolsets["firstbank"];
+
+  console.log(`\n[BankingMCP] Calling tool '${toolName}' with args:`, args);
+  
   if (!serverTools) {
     throw new Error('[BankingMCP] Server "firstbank" not found in toolsets — is mcp_service_fb running?');
   }

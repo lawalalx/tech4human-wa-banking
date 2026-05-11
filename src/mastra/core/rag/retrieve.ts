@@ -42,15 +42,16 @@ export async function retrieveContext(
   });
 
   // 2. Build filter — always restrict to current bank
-  const filter: Record<string, unknown> = { bankId };
-  if (category) filter.category = category;
+  const filterObj: Record<string, unknown> = { bankId };
+  if (category) filterObj.category = category;
 
   // 3. Vector search — fetch more than needed for reranking
   const initialResults = await vectorStore.query({
     indexName: INDEX_NAME,
     queryVector: embedding,
     topK: topK * 2,
-    filter,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    filter: filterObj as any,
   });
 
   if (!initialResults.length) return [];

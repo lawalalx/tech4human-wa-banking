@@ -16,12 +16,13 @@ import { insightsAgent } from "./agents/insights-agent.js";
 import { onboardingWorkflow } from "./workflows/onboarding-workflow.js";
 import { transactionWorkflow } from "./workflows/transaction-workflow.js";
 import { fraudAlertWorkflow } from "./workflows/fraud-alert-workflow.js";
+import { pinCheckWorkflow } from "./workflows/pin-workflow.js";
 
 export const mastra = new Mastra({
   agents: {
     bankingSupervisor,
     onboardingAgent,
-    transactionAgent,
+    transactionAgent, // Call as function to ensure fresh instance with correct context
     securityAgent,
     supportAgent,
     insightsAgent,
@@ -30,6 +31,7 @@ export const mastra = new Mastra({
     onboardingWorkflow,
     transactionWorkflow,
     fraudAlertWorkflow,
+    pinCheckWorkflow,
   },
   storage: sharedPgStore,
   workspace: bankingWorkspace,

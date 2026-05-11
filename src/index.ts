@@ -9,13 +9,18 @@ import { initVectorIndex } from "./mastra/core/rag/vector-store.js";
 import kbUploadRoute from "./mastra/core/rag/routes/upload.route.js";
 import kbDocsRoute from "./mastra/core/rag/routes/docs.route.js";
 import { getBankingMcpToolsets } from "./mastra/core/mcp/banking-mcp-client.js";
+import { warmUpEmbeddingModel } from "./mastra/core/llm/provider.js";
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "whatsapp_verify_2025";
 const BANK_NAME = process.env.BANK_NAME || "First Bank Nigeria";
+const URL = process.env.LOCAL_URL;
+
 
 app.use(express.json());
+
+
 
 // ─── OpenAPI / Swagger Document ────────────────────────────────
 const swaggerDocument = {
@@ -35,11 +40,7 @@ const swaggerDocument = {
   },
   servers: [
     {
-      url: `http://localhost:${PORT}`,
-      description: "Local development",
-    },
-    {
-      url: process.env.PRODUCTION_URL || "https://your-app.onrender.com",
+      url: URL,
       description: "Production",
     },
   ],
@@ -483,7 +484,7 @@ const swaggerDocument = {
           "**Processing pipeline:**\n" +
           "1. Text is extracted from the document\n" +
           "2. Text is chunked (recursive strategy, 512 tokens, 64 overlap)\n" +
-          "3. Each chunk is embedded via OpenAI `text-embedding-3-small`\n" +
+          "3. Each chunk is embedded via OpenAI/FastEmbed\n" +
           "4. Vectors are upserted into the bank's isolated pgvector index\n" +
           "5. Metadata stored in `kb_docs` table for management\n\n" +
           "**Multi-tenant:** documents are scoped to `BANK_ID` — each bank has its own isolated index.\n\n" +
@@ -779,7 +780,7 @@ app.get("/admin/fraud-alerts", async (_req: Request, res: Response) => {
     const { Pool } = await import("pg");
     const pool = new Pool({ connectionString: process.env.DATABASE_URL });
     const { rows } = await pool.query(
-      `SELECT id, phone, risk_score, risk_level, risk_factors, status, created_at
+      `SELECT id, phone, transaction_ref, risk_score, risk_factors, status, created_at
        FROM fraud_alerts
        WHERE status = 'open'
        ORDER BY created_at DESC`
@@ -797,7 +798,7 @@ app.get("/admin/tickets", async (_req: Request, res: Response) => {
     const { Pool } = await import("pg");
     const pool = new Pool({ connectionString: process.env.DATABASE_URL });
     const { rows } = await pool.query(
-      `SELECT id, ticket_id, phone, issue_type, status, priority, created_at
+      `SELECT id, ticket_id, phone, category, status, priority, created_at
        FROM escalation_tickets
        WHERE status IN ('open', 'in_progress')
        ORDER BY created_at DESC`
@@ -841,15 +842,56 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
         content: `Customer name: ${customerName}. Address the customer by this name when appropriate.`,
       });
     }
+    // Force menu on greetings/vague openers regardless of memory history
+    const greetingPattern = /^(hi|hello|hey|start|menu|help|what|how|good\s)/i;
+    const isGreeting = greetingPattern.test(message.trim());
+    if (isGreeting) {
+      messages.push({
+        role: "system",
+        content:
+          `CRITICAL INSTRUCTION — DO THIS NOW:\n` +
+          `The customer sent a greeting. You MUST output the main menu followed IMMEDIATELY by the options tag.\n` +
+          `Your response MUST end with this EXACT block (no exceptions):\n` +
+          `\n` +
+          `<options>\n` +
+          `1. Account & Transactions\n` +
+          `2. Onboarding & KYC\n` +
+          `3. Security\n` +
+          `4. Financial Insights\n` +
+          `5. Support & Help\n` +
+          `</options>\n` +
+          `\n` +
+          `Do NOT omit the <options> block. It is REQUIRED for the WhatsApp UI to work.`,
+      });
+    }
     messages.push({ role: "user", content: message.trim() });
 
-    const mcpToolsets = await getBankingMcpToolsets();
+    // NOTE: toolsets are intentionally NOT injected here — supervisor must delegate
+    // all banking operations to specialist sub-agents via agents{} delegation.
     const response = await supervisor.generate(messages, {
-      memory: { thread: threadId, resource: phoneNorm },
-      ...(Object.keys(mcpToolsets).length > 0 ? { toolsets: mcpToolsets } : {}),
+      memory: { 
+        thread: threadId, 
+        resource: phoneNorm,
+        
+      },
     });
 
-    const reply = response?.text?.trim() ?? "";
+    let reply = response?.text?.trim() ?? "";
+
+    // Server-side safety net: if greeting triggered but LLM omitted <options>, append it.
+    const MAIN_MENU_OPTIONS =
+      `\n<options>\n` +
+      `1. Account & Transactions\n` +
+      `2. Onboarding & KYC\n` +
+      `3. Security\n` +
+      `4. Financial Insights\n` +
+      `5. Support & Help\n` +
+      `</options>`;
+    if (isGreeting && !/<options>/i.test(reply)) {
+      console.log(`[/api/agent/chat] Greeting detected but LLM omitted <options> — appending main menu options tag.`);
+      reply = reply + MAIN_MENU_OPTIONS;
+    }
+
     return res.json({ success: true, reply, phone: phoneNorm, threadId });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Internal error";
@@ -872,13 +914,28 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 // ─── Bootstrap ─────────────────────────────────────────────────
 async function main() {
   console.log("[Server] Running database migrations...");
-  await runMigrations();
+  await runMigrations().catch((err) => {
+    console.error("Error running migrations:", err);
+    process.exit(1);
+  });
 
   console.log("[Server] Initialising knowledge-base tables...");
-  await createKbDocsTable();
+  await createKbDocsTable().catch((err) => {
+    console.error("Error creating kb_docs table:", err);
+    process.exit(1);
+  });
 
   console.log("[Server] Initialising vector index...");
-  await initVectorIndex();
+  await initVectorIndex().catch((err) => {
+    console.error("Error initialising vector index:", err);
+    process.exit(1);
+  });
+
+  console.log("[Server] Warming up embedding model...");
+  await warmUpEmbeddingModel().catch((err) => {
+    console.error("Error warming up embedding model:", err);
+    process.exit(1);
+  });
 
   app.listen(PORT, () => {
     const orgId = process.env.BANK_ID || "default";

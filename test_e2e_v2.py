@@ -383,9 +383,9 @@ def test_agent_flows():
     def p(suffix: str) -> str:
         return f"e2e-{uuid.uuid4().hex[:6]}-{suffix}"
 
-    # 2.1 Greeting / menu
+    # 2.1 Greeting / menu (use registered phone — onboarding gate requires known user)
     try:
-        r = chat(p("greeting"), "Hello")
+        r = chat(JOHN_PHONE, "Hello", "John Doe")
         ok = r.get("success") is True and len(r.get("reply", "")) > 0
         log("Agent: greeting/menu", PASS if ok else FAIL, reply=r.get("reply", ""))
     except Exception as e:
@@ -413,9 +413,9 @@ def test_agent_flows():
     # Pause 45s before transfer test — tests 2-3 consume ~25k TPM; need window to clear
     time.sleep(45)
 
-    # 2.4 Transfer initiation
+    # 2.4 Transfer initiation (use registered phone — PIN gate requires known user)
     try:
-        r = chat(p("transfer"), f"I want to transfer 1000 naira to account {JANE_ACCOUNT}")
+        r = chat(JOHN_PHONE, f"I want to transfer 1000 naira to account {JANE_ACCOUNT}", "John Doe")
         reply = r.get("reply", "")
         ok = r.get("success") is True and any(c in reply.lower() for c in ["pin", "confirm", "transfer", "account", "amount", "send"])
         log("Agent: transfer initiation", PASS if ok else FAIL, reply=reply)
@@ -473,14 +473,15 @@ def test_agent_flows():
         log("Agent: bill payment initiation (Lanre)", FAIL, str(e))
     time.sleep(2)
 
-    # 2.10 Financial insights
+    # 2.10 Financial insights + chart (Lanre — uses transactionChartTool via insights-agent)
     try:
-        r = chat(JOHN_PHONE, "Show me my spending breakdown", "John Doe")
+        r = chat(LANRE_PHONE, "Show me a pie chart of my spending", "Olanrewaju")
         reply = r.get("reply", "")
-        ok = r.get("success") is True and len(reply) > 10
-        log("Agent: financial insights (John)", PASS if ok else FAIL, reply=reply)
+        has_chart = "quickchart.io" in reply or "chart" in reply.lower() or "spending" in reply.lower()
+        ok = r.get("success") is True and has_chart
+        log("Agent: financial insights + chart (Lanre)", PASS if ok else FAIL, reply=reply)
     except Exception as e:
-        log("Agent: financial insights (John)", FAIL, str(e))
+        log("Agent: financial insights + chart (Lanre)", FAIL, str(e))
     # Pause 45s before fraud alert test — prior tests accumulate TPM; give window to clear
     time.sleep(45)
 

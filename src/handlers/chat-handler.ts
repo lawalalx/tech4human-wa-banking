@@ -3,7 +3,6 @@ import { sendAgentReply } from "../utils/send-agent-reply.js";
 import { markAsRead, sendWhatsAppTyping } from "../whatsapp-client.js";
 import { formatPhoneNumber, maskPhone } from "../utils/format-phone.js";
 import { getSessionState, touchSession, buildResumptionHint } from "../utils/session-state.js";
-import { getBankingMcpToolsets } from "../mastra/core/mcp/banking-mcp-client.js";
 
 const TYPING_INTERVAL_MS = 8_000;
 // How long of a gap (ms) qualifies a customer as "returning" for resumption hints
@@ -108,13 +107,15 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
       messages.push({ role: "system", content: resumptionSystemMsg });
       console.log(`[ChatHandler] Injecting resumption hint for ${maskPhone(phone)}: state="${resumptionSystemMsg.slice(0, 80)}..."`);
     }
+
+
     messages.push({ role: "user", content: userText });
 
-    // Inject MCP toolsets from mcp_service_fb (real banking data: balance, transfers,
-    // PIN verification, customer lookup, transaction history, etc.)
-    // Fails gracefully — if MCP server is down, agents use their built-in tools only.
-    const mcpToolsets = await getBankingMcpToolsets();
-
+    // NOTE: MCP toolsets are intentionally NOT injected into the supervisor's generate() call.
+    // The supervisor must delegate ALL banking data operations to specialist sub-agents.
+    // Sub-agents use callBankingTool() (direct HTTP to MCP server) independently.
+    // Injecting toolsets here caused the supervisor to call raw MCP tools directly
+    // (e.g. get_customer_accounts with customer_id=null), bypassing the proper tool chain.
     const response = await supervisor.generate(
       messages,
       {
@@ -122,20 +123,20 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
           thread: threadId,
           resource: phone,
         },
-        ...(Object.keys(mcpToolsets).length > 0 ? { toolsets: mcpToolsets } : {}),
       }
     );
 
-    const replyText = response.text || "Sorry, I was unable to process your request. Please try again.";
+    let replyText = response.text || "Sorry, I was unable to process your request. Please try again.";
+
     await sendAgentReply(rawPhone, replyText);
 
-    console.log(`[ChatHandler] Reply sent to ${maskPhone(phone)}: "${replyText.slice(0, 80)}"`);
+    console.log(`[ChatHandler] Reply sent to ${maskPhone(phone)}: "${replyText.slice(0, 80)}\n..."`);
   } catch (error) {
     console.error(`[ChatHandler] Error processing message for ${maskPhone(phone)}:`, error);
     await sendAgentReply(
       rawPhone,
       `⚠️ Something went wrong on our end. Please try again in a moment.\n\n` +
-        `If the issue persists, call our support line: ${process.env.SUPPORT_PHONE || "+2348001234567"}`
+        `If the issue persists, call our support line: ${process.env.SUPPORT_PHONE}`
     ).catch(() => {});
   } finally {
     typingActive = false;

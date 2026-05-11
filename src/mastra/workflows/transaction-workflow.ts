@@ -25,6 +25,7 @@ const fraudCheckStep = createStep({
     riskLevel: z.enum(["low", "medium", "high", "critical"]),
     action: z.enum(["allow", "require_otp", "hold_and_alert", "block"]),
     alertId: z.string().optional(),
+    amount: z.number(),
   }),
   execute: async ({ inputData }) => {
     const { phone, amount, recipientAccount, isNewRecipient, transactionType } = inputData;
@@ -36,11 +37,11 @@ const fraudCheckStep = createStep({
     if (hour >= 22 || hour <= 5) score += 0.1;
 
     const clamped = Math.min(score, 1);
-    const riskLevel = clamped < 0.3 ? "low" : clamped < 0.6 ? "medium" : clamped < 0.8 ? "high" : "critical";
-    const action = clamped < 0.3 ? "allow" : clamped < 0.6 ? "require_otp" : clamped < 0.8 ? "hold_and_alert" : "block";
+    const riskLevel = (clamped < 0.3 ? "low" : clamped < 0.6 ? "medium" : clamped < 0.8 ? "high" : "critical") as "low" | "medium" | "high" | "critical";
+    const action = (clamped < 0.3 ? "allow" : clamped < 0.6 ? "require_otp" : clamped < 0.8 ? "hold_and_alert" : "block") as "allow" | "require_otp" | "hold_and_alert" | "block";
 
     console.log(`[TransactionWorkflow] Fraud check: ${phone} score=${clamped} action=${action}`);
-    return { phone, riskScore: clamped, riskLevel, action };
+    return { phone, riskScore: clamped, riskLevel, action, amount };
   },
 });
 
@@ -49,6 +50,10 @@ const otpStep = createStep({
   description: "Send OTP to customer for transaction authentication",
   inputSchema: z.object({
     phone: z.string(),
+    riskScore: z.number(),
+    riskLevel: z.enum(["low", "medium", "high", "critical"]),
+    action: z.enum(["allow", "require_otp", "hold_and_alert", "block"]),
+    alertId: z.string().optional(),
     amount: z.number(),
     recipientName: z.string().optional(),
   }),

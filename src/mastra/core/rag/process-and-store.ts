@@ -55,6 +55,9 @@ export async function processAndStore(input: ProcessInput): Promise<ProcessResul
   // 3. Remove previous vectors for this docId (safe idempotent re-index on re-upload)
   await safeDeleteByDocId(docId, bankId);
 
+  console.log("[RAG] Generating chunks...");
+  console.time("chunking");
+
   // 4. Chunk — recursive strategy preserves sentence boundaries
   const doc = MDocument.fromText(text);
   const chunks = await doc.chunk({
@@ -63,17 +66,33 @@ export async function processAndStore(input: ProcessInput): Promise<ProcessResul
     overlap: 64,
   });
   if (!chunks.length) throw new Error("Chunking produced no content");
+  console.timeEnd("chunking");
+  console.log(`[RAG] chunks generated: ${chunks.length}`);
 
-  // 5. Embed in a single batched call
-  const { embeddings } = await embedMany({
-    model: getEmbeddingModel(),
-    values: chunks.map((c) => c.text),
-  });
+  const BATCH_SIZE = 50;
+    const allEmbeddings: number[][] = [];
+    console.log(`[RAG] embedding ${chunks.length} chunks in batches of ${BATCH_SIZE}`);
+    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      const batch = chunks.slice(i, i + BATCH_SIZE).map((c) => c.text);
+      console.log(`[RAG] embedding batch ${i}-${i + batch.length - 1}`);
+      console.time(`embed-batch-${i}`);
+      const { embeddings } = await embedMany({
+        model: getEmbeddingModel(),
+        values: batch,
+      });
+      console.timeEnd(`embed-batch-${i}`);
+      if (!embeddings || embeddings.length !== batch.length) {
+        console.warn(`[RAG] Unexpected embeddings length: got ${embeddings?.length}, expected ${batch.length}`);
+      }
+      allEmbeddings.push(...embeddings);
+    }
 
+  
+  console.time("upsert");
   // 6. Upsert vectors — each chunk carries its text in metadata for retrieval
   await vectorStore.upsert({
     indexName: INDEX_NAME,
-    vectors: embeddings,
+    vectors: allEmbeddings,
     metadata: chunks.map((chunk, i) => ({
       ...baseMetadata,
       text: chunk.text,               // ← retrieved and surfaced to the agent
@@ -82,9 +101,13 @@ export async function processAndStore(input: ProcessInput): Promise<ProcessResul
     })),
   });
 
+  console.timeEnd("upsert");
+  console.log("[RAG] Upsert complete");
+
   console.log(
     `[RAG] Indexed doc="${originalName}" docId=${docId} bank="${bankId}" chunks=${chunks.length}`
   );
+
 
   return {
     success: true,
