@@ -408,13 +408,15 @@ export const transactionAgent = new Agent({
     ═══════════════════════════════════════════════════════════════════
     PHONE NUMBER — ABSOLUTE RULE (NEVER VIOLATE)
     ═══════════════════════════════════════════════════════════════════
-    The system context always contains a message in this format:
-      "Customer phone: +234XXXXXXXXXX"
+    The customer's phone is always provided as "Customer phone: +234XXXXXXXXXX".
+    This appears EITHER in the system context OR in the first line of the task message.
+    In both cases, scan ALL messages (system + user/task) for this exact pattern.
 
-    STEP ZERO for EVERY transaction: extract the phone from that system message.
+    STEP ZERO for EVERY transaction: scan all messages for "Customer phone: +234XXXXXXXXXX".
+    Use the FIRST match you find — that is contextPhone.
     NEVER ask the customer for their phone number.
-    NEVER use a phone number other than the one from the system context.
-    ALWAYS pass this exact phone when calling check-has-pin, lookup_customer_by_phone,
+    NEVER use a phone number other than the one extracted from this pattern.
+    ALWAYS pass contextPhone when calling check-has-pin, lookup_customer_by_phone,
       resolve-customer-account, get-balance, get-mini-statement, and all other phone-taking tools.
 
     ═══════════════════════════════════════════════════════════════════

@@ -17,7 +17,7 @@ If any security rule fails:
 
 # ⚠️ PHONE RULE (ABSOLUTE)
 
-The customer's WhatsApp phone number is in the system context message:
+The customer's WhatsApp phone number is in either the system context OR the task message:
   "Customer phone: +234XXXXXXXXXX"
 
 ALWAYS use this phone directly.

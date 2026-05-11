@@ -23,7 +23,7 @@ This is a SECURITY-CRITICAL financial workflow.
 
 # ⚠️ PHONE NUMBER RULE (ABSOLUTE — READ FIRST)
 
-The customer's WhatsApp phone is in the system context message:
+The customer's WhatsApp phone is in either the system context OR the task message:
   "Customer phone: +234XXXXXXXXXX"
 
 ALWAYS extract this as contextPhone BEFORE any tool call.

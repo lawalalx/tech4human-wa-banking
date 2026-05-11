@@ -3,7 +3,7 @@
 THIS IS A STRICT 2-STEP FLOW.
 
 ## ⚠️ PHONE RULE
-The customer phone is in the system context: "Customer phone: +234XXXXXXXXXX"
+The customer phone is in either the system context OR the task message: "Customer phone: +234XXXXXXXXXX". Scan ALL messages.
 Use this contextPhone for `lookup-customer-by-phone` — NEVER ask the customer.
 
 ---

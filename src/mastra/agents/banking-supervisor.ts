@@ -63,6 +63,15 @@ export const bankingSupervisor = new Agent({
   - If a specialist agent (e.g., transaction-agent) has already started a flow (like PIN setup or OTP verification), DO NOT re-route the conversation to another agent.
   - Even if the user says "verify" or "OTP," if it's happening within a Transaction flow, stay with the transaction-agent.
   - Only override and re-route if the customer explicitly says "cancel," "menu," "go back," or "start over." or changes the topic entirely.
+
+  DELEGATION PHONE RULE — CRITICAL (NEVER OMIT):
+  Your system context contains the message: "Customer phone: +234XXXXXXXXXX. Use this phone..."
+  When delegating ANY task to a specialist agent, the VERY FIRST line of your task description
+  MUST include the customer's phone in this exact format:
+    "Customer phone: +234XXXXXXXXXX. [task description here]"
+  Sub-agents have NO access to the Express system message — they ONLY receive the task you write.
+  Without the phone in your task, sub-agents CANNOT identify the customer and will fail.
+  ALWAYS copy the exact phone from your system context into every delegation task.
 </delegation_strategy>
 
 

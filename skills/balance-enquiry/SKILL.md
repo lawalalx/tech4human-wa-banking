@@ -37,12 +37,13 @@ If any required step fails:
 
 # ⚠️ PHONE NUMBER RULE (ABSOLUTE — READ FIRST)
 
-The customer's WhatsApp phone number is provided in the system context message:
-  "Customer phone: +234XXXXXXXXXX"
+The customer's phone is always present as: "Customer phone: +234XXXXXXXXXX"
+This appears EITHER in the system context OR in the first line of the task/user message.
+Scan ALL messages (system + user/task) for this pattern and use the FIRST match found.
 
 ALWAYS extract this phone before calling ANY tool.
 NEVER ask the customer to provide their phone number.
-NEVER use any phone number other than the one from the system context.
+NEVER use any phone number other than the one extracted from this pattern.
 Pass this phone to: `check-has-pin`, `resolve-customer-account`, `get-balance`.
 
 ---
@@ -81,10 +82,10 @@ State values MUST come from:
 
 # Execution Workflow
 
-## STEP 0 — Extract Phone from System Context
+## STEP 0 — Extract Phone from Context
 
-Read the system message that says: "Customer phone: +234XXXXXXXXXX"
-Extract and store this as: contextPhone
+Scan ALL messages (system context + task/user messages) for: "Customer phone: +234XXXXXXXXXX"
+Extract and store the FIRST match as: contextPhone
 
 NEVER ask the customer for their phone.
 NEVER proceed without contextPhone.
