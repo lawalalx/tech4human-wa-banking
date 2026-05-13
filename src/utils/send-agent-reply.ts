@@ -3,6 +3,7 @@ import {
   sendWhatsAppList,
   sendWhatsAppImage,
 } from "../whatsapp-client.js";
+import { sanitizeAgentReply } from "./sanitize-agent-reply.js";
 
 /**
  * sendAgentReply — smart reply sender matching the senegal pattern.
@@ -56,7 +57,9 @@ function parseOptions(text: string): { cleanText: string; options: Option[] | nu
   return { cleanText, options: options?.length ? options : null };
 }
 
-export async function sendAgentReply(to: string, agentText: string): Promise<void> {
+export async function sendAgentReply(to: string, agentText: unknown): Promise<void> {
+  agentText = sanitizeAgentReply(agentText);
+
   // ── 1. Chart URL — send image first, then remaining text ─────────────────
   const { chartUrl, cleanText: afterChart } = parseChartUrl(agentText);
   if (chartUrl) {

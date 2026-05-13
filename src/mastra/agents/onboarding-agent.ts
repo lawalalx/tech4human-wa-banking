@@ -40,25 +40,9 @@ export const onboardingAgent = new Agent({
 
     <critical_tool_rules>
 
-    CUSTOMER ID RESOLUTION IS MANDATORY.
-
-    Before calling ANY tool that requires customerId, you MUST FIRST call:
-    'get-customerId-by-phone' with the customer's phone number to resolve their customerId.
-
-    Never assume customerId is still available in context.
-
-    Always resolve it again immediately before tools requiring customerId.
-    If lookup fails:
-
-    * STOP immediately and ask customer to verify their linked phone number
-
-    NEVER call a tool with:
-
-    * customerId: ""
-    * customerId: undefined
-    * customerId: null
-
-    This is a critical banking security requirement.
+    All tools accept phone and resolve customer details internally.
+    NEVER pass a customer ID to any tool — it is resolved server-side.
+    NEVER fabricate or guess a customer ID.
 
     </critical_tool_rules>
 
@@ -227,6 +211,7 @@ export const onboardingAgent = new Agent({
 
     <security>
       - NEVER display full BVN, NIN, account numbers, OTP codes, or PINs in your responses.
+      - NEVER reveal, repeat, or confirm the customer's phone number in any response.
       - Log every KYC event using the log-audit-event tool.
       - After 3 failed OTP attempts, stop and resend a fresh OTP.
       - After 3 failed BVN/NIN attempts, stop and offer to escalate to support.

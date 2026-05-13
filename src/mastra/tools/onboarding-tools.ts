@@ -60,9 +60,10 @@ export const checkOnboardingStatusTool = createTool({
   description:
     "Check whether a customer has accepted the Terms & Conditions and verified their phone. " +
     "Call this at the start of any session to decide whether onboarding steps remain. " +
+    "Pass the customer's WhatsApp phone number — the tool resolves the customer ID internally. " +
     "Returns terms_accepted, phone_verified, is_validated.",
   inputSchema: z.object({
-    customerId: z.number().describe("Customer ID. You must call lookup_customer_by_phone to get this"),
+    phone: z.string().describe("Customer's WhatsApp phone number — used to resolve customer ID internally"),
   }),
   outputSchema: z.object({
     found: z.boolean(),
@@ -72,7 +73,14 @@ export const checkOnboardingStatusTool = createTool({
     isValidated: z.boolean(),
     error: z.string().optional(),
   }),
-  execute: async ({ customerId }: { customerId: number }) => {
+  execute: async ({ phone }: { phone: string }) => {
+    const lookup = await callBankingTool<{ found: boolean; customer_id?: number; is_validated?: boolean; message?: string }>(
+      "lookup_customer_by_phone", { phone_number: phone }
+    );
+    if (!lookup.found || !lookup.customer_id) {
+      return { found: false, termsAccepted: false, phoneVerified: false, isValidated: false, error: lookup.message ?? "Customer not found" };
+    }
+    const customerId = lookup.customer_id;
     const result = await callBankingTool<{
       success: boolean;
       customer_id?: number;
@@ -82,26 +90,23 @@ export const checkOnboardingStatusTool = createTool({
     }>("get_onboarding_status", { customer_id: customerId });
 
     if (!result.success) {
-      return {
-        found: false,
-        termsAccepted: false,
-        phoneVerified: false,
-        isValidated: false,
-        error: result.message,
-      };
+      return { found: false, termsAccepted: false, phoneVerified: false, isValidated: false, error: result.message };
     }
 
     const terms = result.terms_accepted ?? false;
-    const phone = result.phone_verified ?? false;
+    const phoneVerified = result.phone_verified ?? false;
+    // Use the is_validated flag directly from the customer record (set by seed/admin),
+    // not computed from terms && phoneVerified (which defaults to false for seeded customers).
+    const isValidated = (lookup.is_validated === true) || (terms && phoneVerified);
 
-    console.log(`\n\n[checkOnboardingStatusTool] Onboarding status for customerId=${customerId}: terms=${terms}, phone=${phone}`);
+    console.log(`\n\n[checkOnboardingStatusTool] Onboarding status for phone=${phone} (customerId=${customerId}): terms=${terms}, phone=${phoneVerified}, isValidated=${isValidated}`);
 
     return {
       found: true,
-      customerId: result.customer_id,
-      termsAccepted: terms,
-      phoneVerified: phone,
-      isValidated: terms && phone,
+      customerId,
+      termsAccepted: terms || isValidated,  // treat validated users as having accepted T&C
+      phoneVerified: phoneVerified || isValidated,
+      isValidated,
     };
   },
 });
@@ -113,24 +118,29 @@ export const acceptTermsAndConditionsTool = createTool({
   description:
     "Record that the customer has explicitly accepted the WhatsApp Banking Terms & Conditions. " +
     "ONLY call this after the customer has replied YES, ACCEPT, or clearly consented. " +
+    "Pass the customer's WhatsApp phone number — the tool resolves the customer ID internally. " +
     "Never call without explicit confirmation.",
   inputSchema: z.object({
-    customerId: z.number().describe("Customer ID gotten calling lookup_customer_by_phone"),
+    phone: z.string().describe("Customer's WhatsApp phone number — used to resolve customer ID internally"),
   }),
   outputSchema: z.object({
     accepted: z.boolean(),
     error: z.string().optional(),
   }),
-  execute: async ({ customerId }: { customerId: number }) => {
-    const result = await callBankingTool<{
-      success: boolean;
-      message?: string;
-    }>("update_onboarding_status", {
+  execute: async ({ phone }: { phone: string }) => {
+    const lookup = await callBankingTool<{ found: boolean; customer_id?: number; message?: string }>(
+      "lookup_customer_by_phone", { phone_number: phone }
+    );
+    if (!lookup.found || !lookup.customer_id) {
+      return { accepted: false, error: lookup.message ?? "Customer not found" };
+    }
+    const customerId = lookup.customer_id;
+    console.log(`[acceptTermsAndConditionsTool] Accepting T&C for phone=${phone} (customerId=${customerId})`);
+    const result = await callBankingTool<{ success: boolean; message?: string }>("update_onboarding_status", {
       customer_id: customerId,
       field: "terms_accepted",
       value: true,
     });
-
     return {
       accepted: result.success,
       error: result.success ? undefined : result.message,
@@ -172,11 +182,11 @@ export const sendPhoneVerificationOtpTool = createTool({
 export const verifyPhoneVerificationOtpTool = createTool({
   id: "verify-phone-verification-otp",
   description:
-    "Verify an OTP entered by the customer." +
-    "STEP 1: You must call 'lookup-customer-by-phone' again to get customerId BEFORE using this tool. " +
+    "Verify an OTP entered by the customer. " +
+    "Pass the customer's WhatsApp phone number — the tool resolves the customer ID internally. " +
     "Returns verified=true if OTP is correct, or verified=false with message if incorrect or expired.",
   inputSchema: z.object({
-    customerId: z.number().describe("Customer ID gotten calling lookup_customer_by_phone"),
+    phone: z.string().describe("Customer's WhatsApp phone number — used to resolve customer ID internally"),
     otp: z.number().describe("The 4-digit OTP entered by the customer"),
   }),
   outputSchema: z.object({
@@ -184,20 +194,23 @@ export const verifyPhoneVerificationOtpTool = createTool({
     found: z.boolean(),
     message: z.string().optional(),
   }),
-  execute: async ({ customerId, otp }: { customerId: number; otp: number }) => {
-    console.log(`\n\n[verifyPhoneVerificationOtpTool] Verifying OTP for customerId=${customerId}, otp=${otp}`);
-    const result = await callBankingTool<{
-      success: boolean;
-      found: boolean;
-      message?: string;
-    }>("verify_otp", { customer_id: customerId, otp_code: otp });
-
-    console.log(`[verifyPhoneVerificationOtpTool] OTP verification result for customerId=${customerId}: success=${result.success}, found=${result.found}, message=${result.message}`);
+  execute: async ({ phone, otp }: { phone: string; otp: number }) => {
+    const lookup = await callBankingTool<{ found: boolean; customer_id?: number; message?: string }>(
+      "lookup_customer_by_phone", { phone_number: phone }
+    );
+    if (!lookup.found || !lookup.customer_id) {
+      return { verified: false, found: false, message: lookup.message ?? "Customer not found" };
+    }
+    const customerId = lookup.customer_id;
+    console.log(`\n\n[verifyPhoneVerificationOtpTool] Verifying OTP for phone=${phone} (customerId=${customerId}), otp=${otp}`);
+    const result = await callBankingTool<{ success: boolean; found: boolean; message?: string }>(
+      "verify_otp", { customer_id: customerId, otp_code: otp }
+    );
+    console.log(`[verifyPhoneVerificationOtpTool] Result for customerId=${customerId}: success=${result.success}, found=${result.found}, message=${result.message}`);
     return {
       verified: result.success,
       found: result.found,
       message: result.message,
-
     };
   },
 });
@@ -208,25 +221,30 @@ export const markPhoneVerifiedTool = createTool({
   description:
     "Mark the customer's phone as verified after they have correctly entered the OTP. " +
     "This completes onboarding and activates their WhatsApp Banking account. " +
+    "Pass the customer's WhatsApp phone number — the tool resolves the customer ID internally. " +
     "Only call this AFTER you have confirmed the customer's entered code matches the sent OTP.",
   inputSchema: z.object({
-    customerId: z.number().describe("Customer ID. You must call lookup_customer_by_phone to get this"),
+    phone: z.string().describe("Customer's WhatsApp phone number — used to resolve customer ID internally"),
   }),
   outputSchema: z.object({
     verified: z.boolean(),
     isNowFullyOnboarded: z.boolean(),
     error: z.string().optional(),
   }),
-  execute: async ({ customerId }: { customerId: number }) => {
-    const result = await callBankingTool<{
-      success: boolean;
-      message?: string;
-    }>("update_onboarding_status", {
+  execute: async ({ phone }: { phone: string }) => {
+    const lookup = await callBankingTool<{ found: boolean; customer_id?: number; message?: string }>(
+      "lookup_customer_by_phone", { phone_number: phone }
+    );
+    if (!lookup.found || !lookup.customer_id) {
+      return { verified: false, isNowFullyOnboarded: false, error: lookup.message ?? "Customer not found" };
+    }
+    const customerId = lookup.customer_id;
+    console.log(`[markPhoneVerifiedTool] Marking phone verified for phone=${phone} (customerId=${customerId})`);
+    const result = await callBankingTool<{ success: boolean; message?: string }>("update_onboarding_status", {
       customer_id: customerId,
       field: "phone_verified",
       value: true,
     });
-
     return {
       verified: result.success,
       isNowFullyOnboarded: result.success,

@@ -23,7 +23,7 @@ export const lookupCustomerByPhoneTool = createTool({
   id: "lookup_customer_by_phone",
   description:
     "Look up the SENDER/CUSTOMER's account(s) based on their WhatsApp phone number. " +
-    "ALWAYS use the phone from the system context message ('Customer phone: +234XXXXXXXXXX'). " +
+    "ALWAYS use the phone extracted from the system context — look for 'Customer phone:' and take the number after it. " +
     "NEVER call this with an account number. NEVER ask the customer for their phone. " +
     "Returns whether the phone is registered, the associated customer ID, and whether a transaction PIN is set. " +
     "This tool is used as the first step in all transaction flows to resolve the customer's account and PIN status.",
@@ -130,7 +130,7 @@ export const resolveCustomerAccountTool = createTool({
   id: "resolve-customer-account",
   description:
     "Look up the bank account(s) associated with the SENDER's phone number. " +
-    "ALWAYS pass the phone from the system context message ('Customer phone: +234XXXXXXXXXX'). " +
+    "ALWAYS pass the phone extracted from the system context — look for 'Customer phone:' and take the number after it. " +
     "Call this FIRST before any balance, statement, transfer or insights tool. " +
     "If the phone is not registered, it prompts the agent to advise the customer to link their WhatsApp number. " +
     "If the customer has multiple accounts, it returns all masked accounts so the agent " +
@@ -218,12 +218,18 @@ export const resolveCustomerAccountTool = createTool({
 export const balanceEnquiryTool = createTool({
   id: "get-balance",
   description:
-    "Retrieve real-time account balance. " +
+    "Retrieve real-time account balance. This tool handles PIN verification internally. " +
     "Pass 'phone' to auto-lookup (single account). " +
-    "Pass 'accountNumber' directly when the customer has already chosen one from a multi-account selection.",
+    "Pass 'accountNumber' directly when the customer has already chosen one from a multi-account selection. " +
+    "If the customer has a PIN set, pass 'pin' extracted from their most recent message. " +
+    "If 'pin' is missing but required, the tool returns pinRequired=true — " +
+    "respond by asking the customer for their 4-digit transaction PIN and call this tool again with pin=<their4Digits>. " +
+    "If PIN is wrong, the tool returns pinVerified=false with attemptsRemaining. " +
+    "DO NOT call verify-transaction-pin separately for balance — this tool handles everything.",
   inputSchema: z.object({
     phone: z.string().optional().describe("Customer's phone — used to auto-lookup their account"),
     accountNumber: z.string().optional().describe("Pre-resolved account number (skip lookup)"),
+    pin: z.string().optional().describe("4-digit PIN from the customer's most recent message — required when customer has a PIN set"),
   }),
   outputSchema: z.object({
     found: z.boolean(),
@@ -231,21 +237,65 @@ export const balanceEnquiryTool = createTool({
     balance: z.number().optional(),
     currency: z.string().optional(),
     accountType: z.string().optional(),
+    pinRequired: z.boolean().optional(),
+    pinCreationRequired: z.boolean().optional(),
+    pinVerified: z.boolean().optional(),
+    attemptsRemaining: z.number().optional(),
     error: z.string().optional(),
   }),
-  execute: async ({ phone, accountNumber }: { phone?: string; accountNumber?: string }) => {
+  execute: async ({ phone, accountNumber, pin }: { phone?: string; accountNumber?: string; pin?: string }) => {
     let resolvedAccount = accountNumber;
+    let customerId: number | undefined;
+    let hasPin = false;
 
     if (!resolvedAccount) {
       if (!phone) return { found: false, error: "Provide phone or accountNumber" };
-      const lookup = await callBankingTool<{ found: boolean; customer_id?: number; message?: string }>(
+      const lookup = await callBankingTool<{ found: boolean; customer_id?: number; has_pin?: boolean; message?: string }>(
         "lookup_customer_by_phone", { phone_number: phone }
       );
       if (!lookup.found || !lookup.customer_id) {
-        return { found: false, error: lookup.message ?? "Customer not found" };
+        return {
+          found: false,
+          error: "Your phone number is not registered with First Bank Nigeria. Please visit any First Bank branch or dial *894# to link your WhatsApp number.",
+        };
       }
+      customerId = lookup.customer_id;
+      hasPin = lookup.has_pin ?? false;
+
+      // MANDATORY PIN GATE — enforce PIN creation/verification BEFORE balance retrieval
+      // PIN is REQUIRED for all transactions
+      if (!hasPin) {
+        // Customer has no PIN yet — must create one first
+        return {
+          found: false,
+          pinCreationRequired: true,
+          error: "🔐 For security, you must create a 4-digit transaction PIN before viewing your balance. This PIN protects your account for all transactions.",
+        };
+      }
+
+      // Customer has PIN — verify it
+      const trimmedPin = pin?.trim() ?? "";
+      if (!trimmedPin || !/^\d{4,6}$/.test(trimmedPin)) {
+        return {
+          found: false,
+          pinRequired: true,
+          error: "🔐 Please enter your 4-digit transaction PIN to view your balance.",
+        };
+      }
+      const pinResult = await callBankingTool<{ is_valid?: boolean; success?: boolean; blocked?: boolean; remaining_attempts?: number; message?: string }>(
+        "verify_pin", { customer_id: customerId, pin: trimmedPin }
+      );
+      if (pinResult.blocked) {
+        return { found: false, pinVerified: false, attemptsRemaining: 0, error: "🔒 Your account is locked due to too many incorrect PIN attempts. Please contact First Bank support." };
+      }
+      const verified = pinResult.is_valid ?? pinResult.success ?? false;
+      if (!verified) {
+        const rem = pinResult.remaining_attempts ?? 0;
+        return { found: false, pinVerified: false, attemptsRemaining: rem, error: `❌ Incorrect PIN. ${rem} attempt(s) remaining. Please try again.` };
+      }
+
       const acct = await callBankingTool<{ success: boolean; account_number?: string; message?: string }>(
-        "get_customer_account", { customer_id: lookup.customer_id }
+        "get_customer_account", { customer_id: customerId }
       );
       if (!acct.success || !acct.account_number) {
         return { found: false, error: acct.message ?? "No account found" };
@@ -259,6 +309,7 @@ export const balanceEnquiryTool = createTool({
     if (!bal.success) return { found: false, error: bal.message ?? "Balance unavailable" };
     return {
       found: true,
+      pinVerified: hasPin ? true : undefined,
       maskedAccount: bal.account_number_masked,
       balance: bal.balance,
       currency: bal.currency ?? "NGN",
@@ -272,13 +323,18 @@ export const balanceEnquiryTool = createTool({
 export const miniStatementTool = createTool({
   id: "get-mini-statement",
   description:
-    "Retrieve the last N transactions. " +
+    "Retrieve the last N transactions. This tool handles PIN verification internally. " +
     "Pass 'phone' to auto-lookup (single account). " +
-    "Pass 'accountNumber' directly when the customer has already chosen from a multi-account selection.",
+    "Pass 'accountNumber' directly when the customer has already chosen from a multi-account selection. " +
+    "If the customer has a PIN set, pass 'pin' extracted from their most recent message. " +
+    "If 'pin' is missing but required, the tool returns pinRequired=true — " +
+    "respond by asking the customer for their 4-digit transaction PIN and call this tool again with pin=<their4Digits>. " +
+    "DO NOT call verify-transaction-pin separately for mini-statement — this tool handles everything.",
   inputSchema: z.object({
     phone: z.string().optional().describe("Customer's phone number — auto-lookup account"),
     accountNumber: z.string().optional().describe("Pre-resolved account number (skip lookup)"),
     limit: z.number().optional().default(10),
+    pin: z.string().optional().describe("4-digit PIN from the customer's most recent message — required when customer has a PIN set"),
   }),
   outputSchema: z.object({
     found: z.boolean(),
@@ -293,21 +349,68 @@ export const miniStatementTool = createTool({
         description: z.string().optional(),
       })
     ).optional(),
+    pinRequired: z.boolean().optional(),
+    pinCreationRequired: z.boolean().optional(),
+    pinVerified: z.boolean().optional(),
+    attemptsRemaining: z.number().optional(),
     error: z.string().optional(),
   }),
-  execute: async ({ phone, accountNumber, limit = 10 }: { phone?: string; accountNumber?: string; limit?: number }) => {
+  execute: async ({ phone, accountNumber, limit = 10, pin }: { phone?: string; accountNumber?: string; limit?: number; pin?: string }) => {
     let resolvedAccount = accountNumber;
+    let customerId: number | undefined;
+    let hasPin = false;
 
     if (!resolvedAccount) {
       if (!phone) return { found: false, error: "Provide phone or accountNumber", transactions: [] };
-      const lookup = await callBankingTool<{ found: boolean; customer_id?: number; message?: string }>(
+      const lookup = await callBankingTool<{ found: boolean; customer_id?: number; has_pin?: boolean; message?: string }>(
         "lookup_customer_by_phone", { phone_number: phone }
       );
       if (!lookup.found || !lookup.customer_id) {
-        return { found: false, error: lookup.message ?? "Customer not found", transactions: [] };
+        return {
+          found: false,
+          error: "Your phone number is not registered with First Bank Nigeria. Please visit any First Bank branch or dial *894# to link your WhatsApp number.",
+          transactions: [],
+        };
       }
+      customerId = lookup.customer_id;
+      hasPin = lookup.has_pin ?? false;
+
+      // MANDATORY PIN GATE — enforce PIN creation/verification BEFORE statement retrieval
+      // PIN is REQUIRED for all transactions
+      if (!hasPin) {
+        // Customer has no PIN yet — must create one first
+        return {
+          found: false,
+          pinCreationRequired: true,
+          error: "🔐 For security, you must create a 4-digit transaction PIN before viewing your transactions. This PIN protects your account for all transactions.",
+          transactions: [],
+        };
+      }
+
+      // Customer has PIN — verify it
+      const trimmedPin = pin?.trim() ?? "";
+      if (!trimmedPin || !/^\d{4,6}$/.test(trimmedPin)) {
+        return {
+          found: false,
+          pinRequired: true,
+          error: "🔐 Please enter your 4-digit transaction PIN to view your transactions.",
+          transactions: [],
+        };
+      }
+      const pinResult = await callBankingTool<{ is_valid?: boolean; success?: boolean; blocked?: boolean; remaining_attempts?: number; message?: string }>(
+        "verify_pin", { customer_id: customerId, pin: trimmedPin }
+      );
+      if (pinResult.blocked) {
+        return { found: false, pinVerified: false, attemptsRemaining: 0, error: "🔒 Your account is locked due to too many incorrect PIN attempts. Please contact First Bank support.", transactions: [] };
+      }
+      const verified = pinResult.is_valid ?? pinResult.success ?? false;
+      if (!verified) {
+        const rem = pinResult.remaining_attempts ?? 0;
+        return { found: false, pinVerified: false, attemptsRemaining: rem, error: `❌ Incorrect PIN. ${rem} attempt(s) remaining. Please try again.`, transactions: [] };
+      }
+
       const acct = await callBankingTool<{ success: boolean; account_number?: string; message?: string }>(
-        "get_customer_account", { customer_id: lookup.customer_id }
+        "get_customer_account", { customer_id: customerId }
       );
       if (!acct.success || !acct.account_number) {
         return { found: false, error: acct.message ?? "No account found", transactions: [] };
@@ -322,6 +425,7 @@ export const miniStatementTool = createTool({
     const masked = an.slice(0, 3) + "****" + an.slice(-4);
     return {
       found: true,
+      pinVerified: hasPin ? true : undefined,
       maskedAccount: masked,
       transactions: hist.transactions ?? [],
     };

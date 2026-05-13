@@ -26,10 +26,14 @@ DO NOT:
 
 # ⚠️ PHONE NUMBER RULE (ABSOLUTE — READ FIRST)
 
-The customer's WhatsApp phone is in either the system context OR the task message: "Customer phone: +234XXXXXXXXXX". Scan ALL messages for this pattern.
-ALWAYS extract this as contextPhone BEFORE calling any tool.
-NEVER ask the customer for their phone number.
-Pass contextPhone to: `check-has-pin`, `resolve-customer-account`, `get-mini-statement`.
+The customer's phone is always provided in a message as: "Customer phone: [actual number]"
+This appears EITHER in the system context OR in the first line of the task message.
+Scan ALL messages for a line starting with "Customer phone: " and extract the actual number.
+
+ALWAYS extract this phone before calling ANY tool.
+NEVER ask the customer to provide their phone number.
+NEVER use a placeholder like "+234XXXXXXXXXX" — only use the real number from the message.
+Pass this phone to: `check-has-pin`, `resolve-customer-account`, `get-mini-statement`.
 
 ---
 
@@ -42,8 +46,16 @@ Pass contextPhone to: `check-has-pin`, `resolve-customer-account`, `get-mini-sta
 
 # STEP 0 — Extract Phone
 
-Read system message: "Customer phone: +234XXXXXXXXXX"
-Store as: contextPhone
+Look through all messages in context for a line that starts with "Customer phone: "
+followed by an actual phone number (starts with "+" and Nigeria country code 234).
+Extract that phone number and store it as contextPhone.
+
+Example: a message saying "Customer phone: +2349013360717" → contextPhone = +2349013360717
+
+CRITICAL: the placeholder "+234XXXXXXXXXX" you see in some instruction templates is NOT a real phone.
+Only use the actual number from the message.
+NEVER ask the customer for their phone.
+NEVER proceed without contextPhone.
 
 ---
 
@@ -56,25 +68,35 @@ Input:
 - phone = contextPhone
 
 Store:
-- customerId
 - hasPin
 
 IF customer not found: STOP. Inform not registered.
 
 ---
 
-# STEP 2 — PIN FLOW
+# STEP 2 — PIN GATE (MANDATORY — THIS STEP ENDS YOUR TURN)
+
+⚠️ DO NOT CALL get-mini-statement in this step. DO NOT continue to STEP 3.
 
 IF `hasPin=false`:
-- LOAD skill: `pin-management`
-- Execute: PIN CREATION FLOW (phone = contextPhone)
+- Send: "To view your mini statement, please create a 4-digit PIN first."
+- Execute PIN CREATION FLOW via pin-management skill (phone = contextPhone)
+- After PIN created: continue to STEP 3.
 
 IF `hasPin=true`:
-- LOAD skill: `pin-management`
-- Execute: PIN VERIFICATION FLOW (customerId from STEP 1)
+- Send EXACTLY this message to the customer and STOP:
+  "🔐 Please enter your 4-digit transaction PIN to view your transactions."
+- END YOUR RESPONSE. Wait for the customer's reply.
+- DO NOT call get-mini-statement now. Your turn is DONE.
 
-ONLY continue if:
-- verified=true
+PIN COLLECTION RULE: Keep the PIN prompt active until the customer sends exactly 4 digits.
+If the customer sends anything other than 4 digits, re-ask for the PIN without calling any tool.
+
+[PIN TURN — customer sends exactly 4 digits]
+- Read those 4 digits from the customer's message.
+- Call: `verify-transaction-pin` (phone=contextPhone, pin=those4Digits)
+- IF verified=false: "❌ Incorrect PIN. [N] attempt(s) remaining." STOP.
+- IF verified=true: continue to STEP 3.
 
 ---
 

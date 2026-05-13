@@ -22,6 +22,9 @@ DO NOT:
 - expose PIN values
 - repeat PINs back to customers
 - bypass confirmation flow
+- call send-phone-verification-otp or verify-phone-verification-otp during PIN creation
+- call any OTP tool until AFTER create-transaction-pin returns created=true
+- proceed to balance/transfer/statement before create-transaction-pin is called and returns created=true
 
 STOP immediately if validation fails.
 

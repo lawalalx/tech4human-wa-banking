@@ -39,11 +39,11 @@ If any required step fails:
 
 The customer's phone is always present as: "Customer phone: +234XXXXXXXXXX"
 This appears EITHER in the system context OR in the first line of the task/user message.
-Scan ALL messages (system + user/task) for this pattern and use the FIRST match found.
+Scan ALL messages for a line starting with "Customer phone: " and extract the actual number.
 
 ALWAYS extract this phone before calling ANY tool.
 NEVER ask the customer to provide their phone number.
-NEVER use any phone number other than the one extracted from this pattern.
+NEVER use a placeholder like "+234XXXXXXXXXX" — only use the real number from the message.
 Pass this phone to: `check-has-pin`, `resolve-customer-account`, `get-balance`.
 
 ---
@@ -66,7 +66,6 @@ Maintain transaction state internally.
 Required state variables:
 - contextPhone (extracted from system message "Customer phone: ...")
 - customerResolved
-- customerId
 - hasPin
 - pinVerified
 - accountResolved
@@ -84,9 +83,13 @@ State values MUST come from:
 
 ## STEP 0 — Extract Phone from Context
 
-Scan ALL messages (system context + task/user messages) for: "Customer phone: +234XXXXXXXXXX"
-Extract and store the FIRST match as: contextPhone
+Look through all messages in context for a line starting with "Customer phone: " followed by an actual phone number.
+Extract that phone number and store it as contextPhone.
 
+Example: "Customer phone: +2349013360717" → contextPhone = +2349013360717
+
+CRITICAL: the placeholder "+234XXXXXXXXXX" in instruction templates is NOT a real phone.
+Only use the actual phone number found in the actual message.
 NEVER ask the customer for their phone.
 NEVER proceed without contextPhone.
 
@@ -101,7 +104,6 @@ Input:
 - phone = contextPhone (from STEP 0)
 
 Store:
-- customerId
 - hasPin
 
 ---
@@ -110,7 +112,7 @@ Store:
 
 IF:
 - customer not found
-- customerId is null or undefined
+- hasPin result is missing or error
 
 THEN:
 - STOP immediately
@@ -144,8 +146,11 @@ IF:
 `hasPin=false`
 
 THEN:
+- **PIN CREATION IS MANDATORY** before balance retrieval
 - LOAD skill: `pin-management`
-- Execute: `PIN CREATION FLOW`
+- Execute: `PIN CREATION FLOW` (customer must set up PIN first)
+- ONLY after PIN creation completes (`created=true`): proceed to balance retrieval
+- **DO NOT show balance without PIN creation**
 - The phone for PIN creation = contextPhone (from STEP 0)
 
 IMPORTANT:
@@ -166,7 +171,7 @@ IF:
 THEN:
 - LOAD skill: `pin-management`
 - Execute: `PIN VERIFICATION FLOW`
-- Use customerId from STEP 1 result
+- Use phone = contextPhone (from STEP 0)
 
 ONLY continue if:
 `verified=true`

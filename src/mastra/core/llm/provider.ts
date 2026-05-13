@@ -52,7 +52,7 @@ export function getChatModel(modelName = process.env.OPENAI_MODEL || "gpt-4o-min
   if (azureConfigured) {
     const deployment = process.env.AZURE_OPENAI_DEPLOYMENT || process.env.AZURE_DEPLOYMENT_NAME || modelName;
     console.log(`\n\nUsing Azure OpenAI (deployment path) — resource: ${resourceName}, deployment: ${deployment}, api-version: ${apiVersion}`);
-    return getAzureProvider(deployment).chat(deployment);
+      return getAzureProvider(deployment).chat(deployment);
   }
 
   console.log(`\n\nUsing OpenAI provider with model: ${modelName}`);

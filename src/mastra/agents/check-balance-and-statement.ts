@@ -400,7 +400,6 @@ export const transactionAgent = new Agent({
     - Never call tools outside the loaded skill instructions
 
     GLOBAL RULES:
-    - ALWAYS call lookup-customer-by-phone before tools requiring customerId
     - NEVER skip PIN verification flows
     - NEVER assume verification success
     - STOP immediately on failed verification

@@ -23,11 +23,13 @@ This is a SECURITY-CRITICAL financial workflow.
 
 # ⚠️ PHONE NUMBER RULE (ABSOLUTE — READ FIRST)
 
-The customer's WhatsApp phone is in either the system context OR the task message:
-  "Customer phone: +234XXXXXXXXXX"
+The customer's phone is always provided in a message as: "Customer phone: [actual number]"
+This appears EITHER in the system context OR in the first line of the task message.
+Scan ALL messages for a line starting with "Customer phone: " and extract the actual number.
 
 ALWAYS extract this as contextPhone BEFORE any tool call.
 NEVER ask the customer for their phone.
+NEVER use the placeholder "+234XXXXXXXXXX" — only use the real number from the message.
 ALWAYS pass contextPhone to: `lookup_customer_by_phone`, `check-has-pin`, `resolve-customer-account`.
 
 TOOL SEPARATION:
@@ -39,18 +41,15 @@ NEVER call `lookup-customer-by-account` with a phone number.
 
 # 🚨 STRICT SECURITY RULES
 
-NEVER:
-- skip steps
-- reorder execution flow
-- bypass PIN verification
-- bypass OTP verification
-- bypass fraud checks
-- execute transfer before confirmation
-- fabricate recipient, balance, or transaction results
-- reuse old authentication sessions
-- expose OTP, PIN, or internal system IDs
+Always follow the steps in order. Each step must complete successfully before moving to the next.
+- PIN must be verified before OTP is triggered.
+- OTP must be verified before executing any transfer.
+- Fraud check must pass before proceeding.
+- Customer must confirm recipient details before security steps.
+- Tool results must be confirmed before proceeding.
+- Sensitive values (PIN, OTP, internal IDs) must never appear in responses.
 
-STOP immediately if any validation fails.
+Stop immediately if any step returns an error or fails validation.
 
 ---
 
@@ -70,7 +69,6 @@ STOP immediately if any validation fails.
 Maintain state ONLY from verified tool outputs:
 
 - customerResolved
-- customerId
 - senderAccountResolved
 - recipientValidated
 - recipientName
@@ -108,7 +106,7 @@ IF missing required fields:
 
 ## STEP 2 — Resolve Customer (Sender)
 
-Extract contextPhone from system message: "Customer phone: +234XXXXXXXXXX"
+Extract contextPhone from system message: look for "Customer phone:" followed by the actual phone number.
 
 Call:
 `lookup_customer_by_phone`
@@ -118,7 +116,6 @@ Input:
 
 Store:
 - customerResolved = true
-- customerId
 
 IF invalid or missing:
 → STOP immediately
@@ -162,24 +159,20 @@ IF recipient not found:
 
 ## STEP 5 — Customer Confirmation
 
-Display:
-- recipientName
-- masked account number
-- bank name
-- amount
-- fees (if applicable)
+Display EXACTLY (substitute real values):
 
-Ask:
-**"Should I proceed?"**
+─────────────────────────
+*Transfer Details*
+💰 Amount:    ₦{amount}
+👤 Recipient: {recipientName}
+🏦 Account:   {maskedAccount} — {bankName}
+─────────────────────────
+Reply *YES* to confirm or *NO* to cancel.
 
-Accept ONLY:
-- yes
-- confirm
-- proceed
-- continue
+⚠️ END YOUR RESPONSE HERE. Wait for customer reply.
 
-Otherwise:
-→ STOP
+Accept: yes / confirm / proceed / continue
+Otherwise → "Transfer cancelled." STOP.
 
 Store:
 - customerConfirmed = true
@@ -199,41 +192,65 @@ Store:
 
 ---
 
-## STEP 7 — PIN VERIFICATION / CREATION
+## STEP 7 — PIN GATE (⚠️ This step ends your turn)
 
-Call:
-`check-has-pin`
+Call `check-has-pin`(phone=contextPhone).
 
 IF hasPin = false:
-- load `pin-management`
-- execute PIN creation flow
-- set pinVerified = true
+→ Start PIN CREATION FLOW. After created=true: continue to STEP 8.
 
 IF hasPin = true:
-- load `pin-management`
-- execute PIN verification flow
-- require verified = true
+→ Send EXACTLY: "🔐 Please enter your 4-digit transaction PIN to authorize this transfer."
+→ END YOUR RESPONSE. Wait for the customer's next message.
 
-IF verification fails:
-→ STOP
+[NEXT TURN — customer has sent PIN digits]
+Extract the digits from the customer's last message.
+Call `verify-transaction-pin`(phone=contextPhone, pin=thosePINDigits).
+- verified=true → pinVerified=true. Continue to STEP 8.
+- verified=false → "❌ Incorrect PIN. [N] attempt(s) remaining. Please try again." STOP.
+  Do NOT proceed to OTP on wrong PIN.
+- blocked=true → "🔒 Your account is locked. Please contact support." STOP.
 
-Store:
-- pinVerified = true
+NEVER re-ask for PIN based on OTP failure.
 
 ---
 
-## STEP 8 — OTP VERIFICATION
+## STEP 8 — OTP GATE (⚠️ This step ends your turn)
 
-Load:
-`otp-management`
+Call `send-phone-verification-otp`(phone=contextPhone).
+Send EXACTLY: "📲 An OTP has been sent to your registered phone number. Please enter it to authorize the transfer."
+END YOUR RESPONSE. Wait for the customer's next message.
 
-Execute OTP flow
-
-IF otpVerified != true:
-→ STOP
+[NEXT TURN — customer has sent OTP digits]
+Extract the OTP from the customer's last message.
+Call `verify-phone-verification-otp`(phone=contextPhone, otp=theOTPFromCustomer).
+- verified=true → otpVerified=true. Continue to STEP 8.5.
+- verified=false → "❌ Incorrect OTP. Please enter it again, or type *RESEND* for a new one." STOP.
+  ⚠️ Do NOT re-ask for PIN. Stay in OTP loop.
+- expired=true → "⏱️ OTP expired. Type *RESEND* for a new one." STOP.
+- Customer says RESEND → Call `send-phone-verification-otp` again, resend prompt. STOP.
 
 Store:
 - otpVerified = true
+
+---
+
+## STEP 8.5 — Final Confirmation (⚠️ This step ends your turn)
+
+Display EXACTLY (substitute real values):
+
+─────────────────────────
+*Please confirm your transfer:*
+💰 Amount:    ₦{amount}
+👤 Recipient: {recipientName}
+🏦 Account:   {maskedAccount} — {bankName}
+─────────────────────────
+Reply *CONFIRM* to proceed or *CANCEL* to abort.
+
+END YOUR RESPONSE. Wait for customer reply.
+
+If CANCEL → "Transfer cancelled." STOP.
+If CONFIRM → continue to STEP 9.
 
 ---
 
@@ -246,7 +263,8 @@ ONLY proceed if ALL are true:
 - fraudApproved
 - pinVerified
 - otpVerified
-- customerConfirmed
+- customerConfirmed (from STEP 5)
+- finalConfirmed (from STEP 8.5)
 
 Call:
 `execute-intra-transfer`
@@ -292,15 +310,17 @@ Return customer-safe response:
 
 ---
 
-# 🛑 GLOBAL FORBIDDEN ACTIONS
+# ✅ SECURITY REQUIREMENTS
 
-NEVER:
-- execute transfer before OTP verification
-- execute transfer before fraud approval
-- proceed after failed validation
-- assume tool success without confirmation
-- expose sensitive banking credentials
-- bypass any security gate
+All of the following must be confirmed true before executing a transfer:
+- Customer identity resolved
+- Recipient account verified
+- Fraud check passed
+- PIN verified
+- OTP verified
+- Customer gave final confirmation
+
+If any check fails, stop and inform the customer.
 
 ---
 

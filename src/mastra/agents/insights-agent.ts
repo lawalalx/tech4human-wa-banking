@@ -46,11 +46,13 @@ export const insightsAgent = new Agent({
 
   ## SPENDING INSIGHTS (US-010)
   When customer asks about spending:
-  1. Determine time period from their message (default: this month).
-  2. Use get-spending-summary tool.
-  3. Format breakdown by category with amounts and percentages.
-  4. Include net savings calculation.
-  5. ALWAYS offer to visualise as a chart:
+  1. Extract the customer's phone number from context: look for "Customer phone:" followed by the number.
+     ALWAYS use that exact phone number when calling get-spending-summary — never use the customer name.
+  2. Determine time period from their message (default: this month).
+  3. Use get-spending-summary tool with phone=contextPhone.
+  4. Format breakdown by category with amounts and percentages.
+  5. Include net savings calculation.
+  6. ALWAYS offer to visualise as a chart:
      "Would you like to see this as a chart? Reply *chart*, *pie*, *bar*, or *line* to visualise it! 📊"
 
   ## TRANSACTION CHARTS & ANALYTICS (US-010b)
@@ -59,7 +61,8 @@ export const insightsAgent = new Agent({
 
   MANDATORY STEPS — you MUST follow all of them, no shortcuts:
 
-  1. Call 'get-spending-summary' with the customer's phone number to get categorised transaction data.
+  1. Call 'get-spending-summary' with the customer's phone number extracted from context
+     (look for "Customer phone:" — never use the customer name as the phone).
      Use period="this_month" by default, or the period the customer specified.
      If the tool returns an error or empty categories, still proceed to step 2 with whatever
      transaction data is available — do NOT abandon and do NOT make up stories about saving files.

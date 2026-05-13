@@ -4,7 +4,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 export interface PendingFlow {
   /** High-level action type */
-  action: "transfer" | "bill_payment" | "kyc" | "otp_verification" | "fraud_review";
+  action: "transfer" | "bill_payment" | "kyc" | "otp_verification" | "fraud_review" | "balance" | "mini_statement";
   /** Where in the flow the customer stopped */
   step: string;
   /** Serializable payload for the action (amount, recipient, biller, etc.) */
@@ -67,6 +67,8 @@ export async function setPendingFlow(phone: string, flow: PendingFlow): Promise<
     kyc: "pending_kyc",
     otp_verification: "awaiting_otp",
     fraud_review: "pending_fraud_review",
+    balance: "pending_balance",
+    mini_statement: "pending_statement",
   };
 
   await pool.query(
@@ -136,6 +138,8 @@ export function buildResumptionHint(
     kyc: "an identity verification (KYC)",
     otp_verification: "an OTP-authenticated action",
     fraud_review: "a fraud alert review",
+    balance: "a balance enquiry",
+    mini_statement: "a mini statement",
   };
 
   const dataLines = Object.entries(pf.data)

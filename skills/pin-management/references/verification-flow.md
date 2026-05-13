@@ -1,7 +1,6 @@
 # PIN Verification Flow
 
-Ask customer:
-
+Ask customer EXACTLY:
 "🔐 Please enter your 4-digit transaction PIN."
 
 ---
@@ -11,17 +10,21 @@ Ask customer:
 When customer sends PIN:
 
 Call:
-verify-transaction-pin
+verify-transaction-pin(phone=contextPhone, pin=enteredPin)
+
+Pass only phone and pin — the tool resolves everything else internally.
 
 IF verified=true:
-- continue transaction immediately
+- Set pinVerified=true
+- Continue transaction immediately. Do NOT prompt for PIN again.
 
 IF verified=false:
 Respond:
-"❌ Incorrect PIN."
+"❌ Incorrect PIN. You have [attemptsRemaining] attempt(s) remaining."
 
-IF attemptsRemaining > 0:
-Inform customer of remaining attempts.
+IF blocked=true:
+"Your account is temporarily locked due to too many incorrect PIN attempts. Please contact support."
+STOP — do NOT continue.
 
 ---
 
@@ -32,3 +35,4 @@ Inform customer of remaining attempts.
 - NEVER hint at correct PIN
 - NEVER bypass verification
 - NEVER continue after failed verification
+- NEVER call check-has-pin more than once per transaction session

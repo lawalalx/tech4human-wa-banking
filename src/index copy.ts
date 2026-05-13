@@ -5,8 +5,7 @@ import { runMigrations } from "./db/migrate.js";
 import { handleIncomingMessage } from "./handlers/chat-handler.js";
 import { mastra } from "./mastra/index.js";
 import { TRANSACTION_UNKNOWN_REPLY, transactionWorkflow } from "./mastra/workflows/transaction-workflow.js";
-import { clearPendingFlow, getSessionState as loadSessionState } from "./utils/session-state.js";
-import { sanitizeAgentReply } from "./utils/sanitize-agent-reply.js";
+import { getSessionState as loadSessionState } from "./utils/session-state.js";
 import { createKbDocsTable } from "./mastra/core/rag/db.js";
 import { initVectorIndex } from "./mastra/core/rag/vector-store.js";
 import kbUploadRoute from "./mastra/core/rag/routes/upload.route.js";
@@ -775,13 +774,7 @@ app.get("/admin/sessions", async (_req: Request, res: Response) => {
     const { Pool } = await import("pg");
     const pool = new Pool({ connectionString: process.env.DATABASE_URL });
     const { rows } = await pool.query(
-      `SELECT phone,
-              customer_name,
-              kyc_status,
-              state,
-              last_active,
-              created_at,
-              context->'pending_flow' AS pending_flow
+      `SELECT phone, customer_name, kyc_status, last_active, created_at
        FROM customer_sessions
        ORDER BY last_active DESC
        LIMIT 100`
@@ -847,10 +840,6 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
     const phoneNorm = phone?.trim() || "test-user";
     const threadId = `thread_${phoneNorm}`;
 
-    if (/^end$/i.test(message.trim())) {
-      await clearPendingFlow(phoneNorm).catch(() => {});
-    }
-
     const session = await loadSessionState(phoneNorm).catch(() => null);
     const pendingAction = session?.pending_flow?.action;
     const hasPendingTransactionFlow = ["balance", "mini_statement", "transfer", "bill_payment"].includes(
@@ -869,7 +858,7 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
       if (wf.status === "success" && wf.result.handled) {
         return res.json({
           success: true,
-          reply: sanitizeAgentReply(wf.result.reply),
+          reply: wf.result.reply,
           phone: phoneNorm,
           threadId,
         });
@@ -890,7 +879,7 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
       if (wf.status === "success" && wf.result.handled && wf.result.reply !== TRANSACTION_UNKNOWN_REPLY) {
         return res.json({
           success: true,
-          reply: sanitizeAgentReply(wf.result.reply),
+          reply: wf.result.reply,
           phone: phoneNorm,
           threadId,
         });
@@ -913,6 +902,33 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
     }
 
 
+    
+    // ============================
+    // Force menu on greetings/vague openers regardless of memory history
+    const greetingPattern = /^(hi|hello|hey|start|menu|help|what|how|good\s)/i;
+    const isGreeting = greetingPattern.test(message.trim());
+    if (isGreeting) {
+      messages.push({
+        role: "system",
+        content:
+          `CRITICAL INSTRUCTION — DO THIS NOW:\n` +
+          `The customer sent a greeting. You MUST output the main menu followed IMMEDIATELY by the options tag.\n` +
+          `Your response MUST end with this EXACT block (no exceptions):\n` +
+          `\n` +
+          `<options>\n` +
+          `1. Account & Transactions\n` +
+          `2. Onboarding & KYC\n` +
+          `3. Security\n` +
+          `4. Financial Insights\n` +
+          `5. Support & Help\n` +
+          `</options>\n` +
+          `\n` +
+          `Do NOT omit the <options> block. It is REQUIRED for the WhatsApp UI to work.`,
+      });
+    }
+    // =============================
+
+
     messages.push({ role: "user", content: message.trim() });
 
     // NOTE: toolsets are intentionally NOT injected here — supervisor must delegate
@@ -925,7 +941,25 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
       },
     });
 
-    const reply = sanitizeAgentReply(response?.text?.trim() ?? "");
+    let reply = response?.text?.trim() ?? "";
+
+
+    // ============================
+    // Server-side safety net: if greeting triggered but LLM omitted <options>, append it.
+    const MAIN_MENU_OPTIONS =
+      `\n<options>\n` +
+      `1. Account & Transactions\n` +
+      `2. Onboarding & KYC\n` +
+      `3. Security\n` +
+      `4. Financial Insights\n` +
+      `5. Support & Help\n` +
+      `</options>`;
+    if (isGreeting && !/<options>/i.test(reply)) {
+      console.log(`[/api/agent/chat] Greeting detected but LLM omitted <options> — appending main menu options tag.`);
+      reply = reply + MAIN_MENU_OPTIONS;
+    }
+// ====================================
+
 
     return res.json({ success: true, reply, phone: phoneNorm, threadId });
   } catch (err: unknown) {

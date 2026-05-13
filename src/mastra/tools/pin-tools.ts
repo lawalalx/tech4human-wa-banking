@@ -26,19 +26,21 @@ export const checkHasPinTool = createTool({
   id: "check-has-pin",
   description:
     "Check whether the customer has already set a transaction PIN. " +
-    "ALWAYS pass the customer's WhatsApp phone number from the system context message " +
-    "(format: 'Customer phone: +234XXXXXXXXXX'). NEVER ask the customer for their phone — use it from context. " +
-    "Returns customerId (needed for create/verify calls) and hasPin flag. " +
-    "Call this before initiating any money-movement transaction. " +
-    "If hasPin=false, guide the customer through PIN creation before proceeding.",
+    "ALWAYS pass the customer's phone number extracted from the system context — " +
+    "look for the text 'Customer phone:' and take the number that follows it. NEVER ask the customer for their phone. " +
+    "Returns found (whether the customer exists) and hasPin (whether PIN is set). " +
+    "CRITICAL: After calling this tool, READ the 'action' field and follow it exactly. " +
+    "If found=false: inform the customer their phone is not registered and stop. " +
+    "If found=true: the action field will instruct you to STOP and send a PIN prompt. " +
+    "DO NOT call get-balance, get-mini-statement, or any transaction tool in the SAME turn as check-has-pin. " +
+    "You MUST send a PIN prompt to the customer and wait for their next message before proceeding.",
   inputSchema: z.object({
     phone: z.string().describe("Customer's WhatsApp phone number"),
   }),
   outputSchema: z.object({
     found: z.boolean(),
-    customerId: z.number().optional(),
     hasPin: z.boolean(),
-    action: z.string().describe("Next action for the flow based on PIN status"),
+    action: z.string().describe("Next action: VERIFY_PIN or CREATE_PIN"),
     message: z.string().optional(),
   }),
   execute: async ({ phone }: { phone: string }) => {
@@ -52,9 +54,13 @@ export const checkHasPinTool = createTool({
 
     const finalResult = {
       found: result.found ?? false,
-      customerId: result.customer_id,
-      hasPin: result.has_pin ?? false,  
-      action: result.has_pin ? 'VERIFY_PIN' : 'CREATE_PIN',
+      hasPin: result.has_pin ?? false,
+      // Explicit next-step instruction for the LLM agent:
+      action: result.found === false
+        ? 'STOP: phone not registered. Respond: "Your number is not registered with First Bank Nigeria. Please visit any branch or dial *894# to link your account." then end.'
+        : result.has_pin
+          ? 'STOP_AND_PROMPT: Customer has a PIN. Send EXACTLY: "🔐 Please enter your 4-digit transaction PIN." then END YOUR TURN. In the NEXT TURN when customer sends 4 digits: call get-balance(phone=contextPhone, pin=thatPIN) or get-mini-statement(phone=contextPhone, pin=thatPIN) — those tools verify the PIN internally. DO NOT call verify-transaction-pin for balance/statement.'
+          : 'STOP_AND_PROMPT: Customer has no PIN. Follow PIN CREATION FLOW exactly. STEP 1: Send EXACTLY "Please enter a new 4-digit transaction PIN." then END THIS TURN. DO NOT call create-transaction-pin, send-phone-verification-otp, or any other tool yet. Wait for the customer to reply with 4 digits. Do NOT proceed with the original request until PIN creation is complete (create-transaction-pin returns created=true).',
       message: result.message,
     };
     console.log(`[checkHasPinTool] PIN status for phone=${phone}: found=${finalResult.found}`);
@@ -68,21 +74,31 @@ export const createTransactionPinTool = createTool({
   id: "create-transaction-pin",
   description:
     "Save a new 4-digit transaction PIN for the customer. " +
-    "Only call this AFTER the customer has entered their desired PIN and confirmed it matches. " +
+    "Only call this AFTER the customer has entered their desired PIN AND confirmed it a second time and both entries match. " +
+    "Call this tool EXACTLY ONCE per PIN creation flow — NEVER call it twice. " +
     "If the two PIN entries do not match, do NOT call this tool — ask the customer to re-enter. " +
-    "Returns success/failure and any validation error message.",
+    "When this tool returns created=true, the flow is COMPLETE. Do NOT call it again. " +
+    "Respond immediately with success and continue with the original transaction. " +
+    "Pass the customer's WhatsApp phone number (from context) — the tool resolves the customer ID internally. " +
+    "Returns created=true on success, created=false with errorCode on failure.",
   inputSchema: z.object({
-    customerId: z.number().describe("Customer ID. You must call lookup_customer_by_phone to get this"),
+    phone: z.string().describe("Customer's WhatsApp phone number from context — used to resolve the correct customer ID internally"),
     pin: z.string().length(4).regex(/^\d{4}$/, "Must be exactly 4 digits").describe("The 4-digit PIN to save"),
   }),
   outputSchema: z.object({
     created: z.boolean(),
     message: z.string().optional(),
-    errorCode: z.string().optional(),
+    errorCode: z.string().nullable().optional(),
   }),
-  execute: async ({ customerId, pin }: { customerId: number; pin: string }) => {
-
-    console.log(`[createTransactionPinTool] Attempting to create PIN for customerId=${customerId}`);
+  execute: async ({ phone, pin }: { phone: string; pin: string }) => {
+    // Always resolve customerId from phone — never trust LLM-supplied IDs
+    const customer = await callBankingTool<{ found: boolean; customer_id?: number }>("lookup_customer_by_phone", { phone_number: phone });
+    if (!customer.found || !customer.customer_id) {
+      console.log(`[createTransactionPinTool] Customer not found for phone=${phone}`);
+      return { created: false, message: "Customer not found", errorCode: "CUSTOMER_NOT_FOUND" };
+    }
+    const customerId = customer.customer_id;
+    console.log(`[createTransactionPinTool] Creating PIN for phone=${phone} → customerId=${customerId}`);
     const result = await callBankingTool<{
       success: boolean;
       message?: string;
@@ -92,9 +108,9 @@ export const createTransactionPinTool = createTool({
     const finalResult = {
       created: result.success,
       message: result.message,
-      errorCode: result.error_code,
+      errorCode: result.error_code ?? null,
     };
-    console.log(`[createTransactionPinTool] PIN creation result for customerId=${customerId}: created=${finalResult.created}, message=${finalResult.message}, errorCode=${finalResult.errorCode}`);
+    console.log(`[createTransactionPinTool] Result for customerId=${customerId}: created=${finalResult.created}, message=${finalResult.message}`);
     return finalResult;
   },
 });
@@ -106,11 +122,11 @@ export const verifyTransactionPinTool = createTool({
   description:
     "Verify the customer's 4-digit transaction PIN before executing a money-movement. " +
     "Call this AFTER the customer enters their PIN. " +
-    "STEP 1: You must call 'lookup-customer-by-phone' again to get customerId BEFORE using this tool. " +
+    "Pass the customer's WhatsApp phone number (from context) — the tool resolves the customer ID internally. " +
     "Returns verified=true on success, or verified=false with attemptsRemaining and blocked flag. " +
     "If blocked=true, stop the transaction — the account is temporarily PIN-locked.",
   inputSchema: z.object({
-    customerId: z.number().describe("Customer ID. You must call lookup_customer_by_phone to get this"),
+    phone: z.string().describe("Customer's WhatsApp phone number from context — used to resolve the correct customer ID internally"),
     pin: z.string().describe("The 4-digit PIN entered by the customer. Always ask, don't assume it from history"),
   }),
   outputSchema: z.object({
@@ -119,8 +135,16 @@ export const verifyTransactionPinTool = createTool({
     attemptsRemaining: z.number().optional(),
     blocked: z.boolean(),
   }),
-  execute: async ({ customerId, pin }: { customerId: number; pin: string }) => {
-    console.log(`[verifyTransactionPinTool] Verifying PIN for customerId=${customerId}`);
+  execute: async ({ phone, pin }: { phone: string; pin: string }) => {
+    // Always resolve customerId from phone — never trust LLM-supplied IDs
+    const customer = await callBankingTool<{ found: boolean; customer_id?: number }>("lookup_customer_by_phone", { phone_number: phone });
+    
+    if (!customer.found || !customer.customer_id) {
+      console.log(`[verifyTransactionPinTool] Customer not found for phone=${phone}`);
+      return { verified: false, message: "Customer not found", attemptsRemaining: 0, blocked: false };
+    }
+    const customerId = customer.customer_id;
+    console.log(`[verifyTransactionPinTool] Verifying PIN for phone=${phone} → customerId=${customerId}`);
     const result = await callBankingTool<{
       success: boolean;
       message?: string;
@@ -128,14 +152,14 @@ export const verifyTransactionPinTool = createTool({
       blocked?: boolean;
     }>("verify_pin", { customer_id: customerId, pin });
 
-    const finalResult =  {
+    const finalResult = {
       verified: result.success,
       message: result.message,
       attemptsRemaining: result.attempts_remaining,
       blocked: result.blocked ?? false,
     };
 
-    console.log(`[verifyTransactionPinTool] Verification result for customerId=${customerId}: verified=${finalResult.verified}, attemptsRemaining=${finalResult.attemptsRemaining}, blocked=${finalResult.blocked}`);
+    console.log(`[verifyTransactionPinTool] Result for customerId=${customerId}: verified=${finalResult.verified}, attemptsRemaining=${finalResult.attemptsRemaining}, blocked=${finalResult.blocked}`);
     return finalResult;
   },
 });

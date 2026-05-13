@@ -14,16 +14,9 @@ tags:
 
 This skill handles all customer bill payments.
 
-THIS IS A SECURITY-CRITICAL FLOW.
-
-DO NOT:
-- skip PIN verification
-- skip OTP verification
-- bypass biller validation
-- execute payment before customer confirmation
-- fabricate billers or amounts
-
-STOP immediately if any validation fails.
+This is a security-critical flow. Each step must complete before the next begins.
+Always validate the biller, verify the customer PIN, and verify the OTP before executing payment.
+Stop immediately if any step fails.
 
 ---
 
@@ -38,110 +31,106 @@ Read BEFORE execution:
 
 ---
 
-# STEP 1 — Resolve Customer
+# STEP 1 — Collect Payment Details
 
-Call:
-`lookup-customer-by-phone`
-
-Extract:
-- customerId
-
-IF invalid:
-- STOP immediately
-
----
-
-# STEP 2 — Check PIN Status
-
-Call:
-`check-has-pin`
-
-Store:
-- hasPin
-
----
-
-# STEP 3 — PIN FLOW ROUTING
-
-IF `hasPin=false`:
-- LOAD skill: `pin-management`
-- Execute: PIN CREATION FLOW
-- mark `pinVerified=true`
-
-IF `hasPin=true`:
-- LOAD skill: `pin-management`
-- Execute: PIN VERIFICATION FLOW
-- ONLY continue if `verified=true`
-- set `pinVerified=true`
-
-IF pin verification fails:
-- STOP immediately
-
----
-
-# STEP 4 — Validate Biller
-
-Call:
-`validate-biller`
-
-Extract:
-- billerName
-- customerReference
-- amountDue
-
-IF invalid:
-- STOP immediately
-
----
-
-# STEP 5 — Customer Confirmation
-
-Show:
-- biller
+Extract from customer message:
+- billerName / biller type (DSTV, electricity, airtime, data, etc.)
+- smart card / meter / phone number / reference
 - amount
-- customer reference
 
-Ask:
-"Should I proceed with this payment?"
-
-IF no explicit confirmation:
-- STOP
+If any required field is missing, ask for it. Do NOT proceed until all are provided.
 
 ---
 
-# STEP 6 — OTP FLOW
+# STEP 2 — Validate Biller
 
-Call:
-`send-phone-verification-otp`
+Call `validate-biller`(billerName).
 
-Then:
-Call:
-`verify-phone-verification-otp`
+Display the biller details for confirmation:
+─────────────────────────
+*Bill Payment Details*
+📺 Biller:    {billerName}
+🆔 ID/Number: {smartCardOrMeterNumber}
+👤 Name:      {customerName}
+💰 Amount:    ₦{amount}
+─────────────────────────
+Reply *YES* to confirm or *NO* to cancel.
 
-ONLY continue if:
-- verified=true
+⚠️ END YOUR RESPONSE. Wait for customer reply.
 
-IF failed:
-- STOP
-
----
-
-# STEP 7 — Execute Payment
-
-Call:
-`execute-bill-payment`
-
-Store:
-- success=true
+If NO: "Payment cancelled." STOP.
+If YES: continue.
 
 ---
 
-# STEP 8 — Receipt + Audit
+# STEP 3 — PIN GATE (⚠️ This step ends your turn)
 
-Call:
-`generate-receipt`
-Call:
-`log-audit-event`
+Call `check-has-pin`(phone=contextPhone).
+
+IF hasPin=false:
+→ Start PIN CREATION FLOW. After created=true: continue to STEP 4.
+
+IF hasPin=true:
+→ Send EXACTLY: "🔐 Please enter your 4-digit transaction PIN to authorize this payment."
+→ END YOUR RESPONSE. Wait for the customer's next message.
+
+[NEXT TURN — customer has sent PIN digits]
+Extract digits from customer's last message.
+Call `verify-transaction-pin`(phone=contextPhone, pin=thosePINDigits).
+- verified=true → pinVerified=true. Continue to STEP 4.
+- verified=false → "❌ Incorrect PIN. [N] attempt(s) remaining." STOP. Do NOT go to OTP.
+- blocked=true → "🔒 Account locked. Contact support." STOP.
+
+---
+
+# STEP 4 — OTP GATE (⚠️ This step ends your turn)
+
+Call `send-phone-verification-otp`(phone=contextPhone).
+Send EXACTLY: "📲 An OTP has been sent to your registered phone number. Please enter it to authorize the payment."
+END YOUR RESPONSE. Wait for the customer's next message.
+
+[NEXT TURN — customer has sent OTP digits]
+Extract OTP from customer's last message.
+Call `verify-phone-verification-otp`(phone=contextPhone, otp=theOTPFromCustomer).
+- verified=true → otpVerified=true. Continue to STEP 5.
+- verified=false → "❌ Incorrect OTP. Please enter it again, or type *RESEND* for a new one." STOP.
+  ⚠️ Do NOT re-ask for PIN. Stay in OTP loop.
+- expired=true → "⏱️ OTP expired. Type *RESEND* for a new one." STOP.
+- Customer says RESEND → Resend OTP, re-prompt. STOP.
+
+---
+
+# STEP 5 — Final Confirmation (⚠️ This step ends your turn)
+
+─────────────────────────
+*Please confirm your payment:*
+📺 Biller:    {billerName}
+🆔 ID/Number: {smartCardOrMeterNumber}
+👤 Name:      {customerName}
+💰 Amount:    ₦{amount}
+─────────────────────────
+Reply *CONFIRM* to proceed or *CANCEL* to abort.
+
+END YOUR RESPONSE. Wait for customer reply.
+
+If CANCEL: "Payment cancelled." STOP.
+If CONFIRM: continue to STEP 6.
+
+---
+
+# STEP 6 — Execute Payment
+
+Call `execute-bill-payment`.
+
+On success: show receipt.
+On failure: "Payment failed. Please try again or contact support." STOP.
+
+---
+
+# STEP 7 — Receipt + Audit
+
+Call `generate-receipt`.
+Call `log-audit-event`(event="transaction_initiated").
 
 ---
 

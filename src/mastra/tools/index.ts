@@ -45,3 +45,4 @@ export {
 
 export { transactionChartTool } from "./chart-tools.js";
 export { knowledgeBaseTool } from "./knowledge-base-tool.js";
+export { runTransactionWorkflowTool } from "./transaction-workflow-tool.js";

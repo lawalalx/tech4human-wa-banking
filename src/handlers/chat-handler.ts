@@ -1,8 +1,9 @@
 import { mastra } from "../mastra/index.js";
+import { TRANSACTION_UNKNOWN_REPLY, transactionWorkflow } from "../mastra/workflows/transaction-workflow.js";
 import { sendAgentReply } from "../utils/send-agent-reply.js";
 import { markAsRead, sendWhatsAppTyping } from "../whatsapp-client.js";
 import { formatPhoneNumber, maskPhone } from "../utils/format-phone.js";
-import { getSessionState, touchSession, buildResumptionHint } from "../utils/session-state.js";
+import { clearPendingFlow, getSessionState, touchSession, buildResumptionHint } from "../utils/session-state.js";
 
 const TYPING_INTERVAL_MS = 8_000;
 // How long of a gap (ms) qualifies a customer as "returning" for resumption hints
@@ -90,6 +91,52 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
   }, TYPING_INTERVAL_MS);
 
   try {
+    if (/^end$/i.test(userText.trim())) {
+      await clearPendingFlow(phone).catch(() => {});
+    }
+
+    const session = await getSessionState(phone).catch(() => null);
+    const pendingAction = session?.pending_flow?.action;
+    const hasPendingTransactionFlow = ["balance", "mini_statement", "transfer", "bill_payment"].includes(
+      String(pendingAction || "")
+    );
+    if (hasPendingTransactionFlow) {
+      const run = await transactionWorkflow.createRun();
+      const wf = await run.start({
+        inputData: {
+          phone,
+          action: pendingAction as any,
+          message: userText,
+        },
+      });
+
+      if (wf.status === "success" && wf.result.handled) {
+        await sendAgentReply(rawPhone, wf.result.reply);
+        const workflowReplyPreview = typeof wf.result.reply === "string" ? wf.result.reply : JSON.stringify(wf.result.reply);
+        console.log(`[ChatHandler] Workflow reply sent to ${maskPhone(phone)}: "${workflowReplyPreview.slice(0, 80)}\n..."`);
+        return;
+      }
+    }
+
+    // Run transaction workflow first for fresh requests as well.
+    // If it returns the unknown sentinel, continue with supervisor for general conversation.
+    {
+      const run = await transactionWorkflow.createRun();
+      const wf = await run.start({
+        inputData: {
+          phone,
+          message: userText,
+        },
+      });
+
+      if (wf.status === "success" && wf.result.handled && wf.result.reply !== TRANSACTION_UNKNOWN_REPLY) {
+        await sendAgentReply(rawPhone, wf.result.reply);
+        const workflowReplyPreview = typeof wf.result.reply === "string" ? wf.result.reply : JSON.stringify(wf.result.reply);
+        console.log(`[ChatHandler] Workflow reply sent to ${maskPhone(phone)}: "${workflowReplyPreview.slice(0, 80)}\n..."`);
+        return;
+      }
+    }
+
     const supervisor = mastra.getAgent("bankingSupervisor");
 
     // Thread ID is per-user; provides persistent memory across sessions via PostgreSQL.
@@ -126,7 +173,7 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
       }
     );
 
-    let replyText = response.text || "Sorry, I was unable to process your request. Please try again.";
+    const replyText = response.text || "Sorry, I was unable to process your request. Please try again.";
 
     await sendAgentReply(rawPhone, replyText);
 

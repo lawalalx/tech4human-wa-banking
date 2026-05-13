@@ -1,9 +1,18 @@
 # PIN Creation Flow
 
-THIS IS A STRICT 2-STEP FLOW.
+THIS IS A STRICT 3-TURN FLOW (ask PIN → confirm PIN → create PIN).
+
+## ⚠️ OTP TOOL BAN
+DURING PIN CREATION, NEVER call:
+- send-phone-verification-otp
+- verify-phone-verification-otp
+Those tools are ONLY for transfers and bill payments — NOT for creating a PIN.
+The customer's 4-digit input is their desired PIN, NOT an OTP.
 
 ## ⚠️ PHONE RULE
-The customer phone is in either the system context OR the task message: "Customer phone: +234XXXXXXXXXX". Scan ALL messages.
+The customer's phone is provided in a message as: "Customer phone: [actual number]"
+Scan ALL messages for a line starting with "Customer phone: " and extract the actual number.
+NEVER use the placeholder "+234XXXXXXXXXX" as an actual phone — only the real number from the message.
 Use this contextPhone for `lookup-customer-by-phone` — NEVER ask the customer.
 
 ---
@@ -55,16 +64,21 @@ STOP.
 
 IF both PINs match:
 
-1. Extract contextPhone from system message "Customer phone: ..."
-2. Use the customerId already stored from check-has-pin in the parent flow.
-   If customerId is missing, call: lookup-customer-by-phone(phone=contextPhone)
-3. Extract valid customerId
-4. Call: create-transaction-pin(customerId, pin=pending_pin)
+Call: create-transaction-pin(phone=contextPhone, pin=pending_pin) EXACTLY ONCE.
+Pass only phone and pin — the tool resolves everything else internally.
 
 ---
 
-# SUCCESS RULE
+# SUCCESS RULE — CRITICAL
+
+When create-transaction-pin returns created=true:
+- Respond EXACTLY: "✅ Your transaction PIN has been created successfully!"
+- Set pinVerified=true for this session.
+- DO NOT call create-transaction-pin again — the flow is COMPLETE.
+- DO NOT ask for PIN again — proceed directly with the original request.
+
+When create-transaction-pin returns created=false:
+- Respond: "PIN setup failed. Please try again." and restart from STEP 1.
 
 A newly created PIN counts as VERIFIED for the CURRENT transaction session ONLY.
-
 DO NOT ask customer for PIN again immediately after successful creation.
