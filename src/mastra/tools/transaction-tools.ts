@@ -346,7 +346,7 @@ export const miniStatementTool = createTool({
         amount: z.number(),
         currency: z.string(),
         reference: z.string(),
-        description: z.string().optional(),
+        description: z.string().nullable().optional(),
       })
     ).optional(),
     pinRequired: z.boolean().optional(),
@@ -423,11 +423,24 @@ export const miniStatementTool = createTool({
     );
     const an = resolvedAccount;
     const masked = an.slice(0, 3) + "****" + an.slice(-4);
+    const normalizedTransactions = Array.isArray(hist?.transactions)
+      ? hist.transactions.map((txn) => ({
+          date: String(txn?.date ?? new Date().toISOString()),
+          type: String(txn?.type ?? "Transaction"),
+          amount: Number(txn?.amount ?? 0),
+          currency: String(txn?.currency ?? "NGN"),
+          reference: String(txn?.reference ?? "N/A"),
+          description:
+            txn?.description == null
+              ? undefined
+              : String(txn.description),
+        }))
+      : [];
     return {
       found: true,
       pinVerified: hasPin ? true : undefined,
       maskedAccount: masked,
-      transactions: hist.transactions ?? [],
+      transactions: normalizedTransactions,
     };
   },
 });

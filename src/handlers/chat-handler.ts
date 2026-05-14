@@ -1,5 +1,6 @@
 import { mastra } from "../mastra/index.js";
 import { TRANSACTION_UNKNOWN_REPLY, transactionWorkflow } from "../mastra/workflows/transaction-workflow.js";
+import { INSIGHTS_UNKNOWN_REPLY, insightsWorkflow } from "../mastra/workflows/insights-workflow.js";
 import { sendAgentReply } from "../utils/send-agent-reply.js";
 import { markAsRead, sendWhatsAppTyping } from "../whatsapp-client.js";
 import { formatPhoneNumber, maskPhone } from "../utils/format-phone.js";
@@ -133,6 +134,24 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
         await sendAgentReply(rawPhone, wf.result.reply);
         const workflowReplyPreview = typeof wf.result.reply === "string" ? wf.result.reply : JSON.stringify(wf.result.reply);
         console.log(`[ChatHandler] Workflow reply sent to ${maskPhone(phone)}: "${workflowReplyPreview.slice(0, 80)}\n..."`);
+        return;
+      }
+    }
+
+    // Run insights workflow before supervisor fallback to keep analytics/chart behavior deterministic.
+    {
+      const run = await insightsWorkflow.createRun();
+      const wf = await run.start({
+        inputData: {
+          phone,
+          message: userText,
+        },
+      });
+
+      if (wf.status === "success" && wf.result.handled && wf.result.reply !== INSIGHTS_UNKNOWN_REPLY) {
+        await sendAgentReply(rawPhone, wf.result.reply);
+        const workflowReplyPreview = typeof wf.result.reply === "string" ? wf.result.reply : JSON.stringify(wf.result.reply);
+        console.log(`[ChatHandler] Insights workflow reply sent to ${maskPhone(phone)}: "${workflowReplyPreview.slice(0, 80)}\n..."`);
         return;
       }
     }

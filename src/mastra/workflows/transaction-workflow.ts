@@ -131,6 +131,70 @@ function asBillReference(value?: string): string | null {
   return match ? match[0] : null;
 }
 
+function asTxnLimit(value?: string): number | null {
+  if (!value) return null;
+  const text = value.toLowerCase();
+  const match = text.match(/(?:last|recent)?\s*(\d{1,2})\s*(?:transactions?|txns?|statement)/i);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.min(20, Math.max(1, parsed));
+}
+
+function asNarration(value?: string): string | null {
+  if (!value) return null;
+  const text = value.trim();
+  const explicit = text.match(/(?:description|narration|note)\s*[:=-]\s*(.+)$/i);
+  if (explicit?.[1]) return explicit[1].trim().slice(0, 80);
+
+  const natural = text.match(/\bfor\s+([a-z][a-z0-9\s,&-]{2,80})$/i);
+  if (natural?.[1]) return natural[1].trim().slice(0, 80);
+
+  return null;
+}
+
+function shouldBypassTransactionRouting(message: string): boolean {
+  const text = (message || "").toLowerCase();
+
+  const insightsKeywords = [
+    "insight",
+    "spending",
+    "budget",
+    "credit score",
+    "credit health",
+    "finance analysis",
+    "chart",
+    "graph",
+    "trend",
+    "pie",
+    "bar",
+    "line",
+    "savings",
+  ];
+
+  const transactionKeywords = [
+    "balance",
+    "statement",
+    "mini statement",
+    "transaction pin",
+    "transfer",
+    "send money",
+    "pay bill",
+    "bill payment",
+    "airtime",
+    "data bundle",
+    "dstv",
+    "gotv",
+    "electricity",
+    "meter",
+  ];
+
+  const hasInsightsKeyword = insightsKeywords.some((keyword) => text.includes(keyword));
+  const hasTransactionKeyword = transactionKeywords.some((keyword) => text.includes(keyword));
+
+  return hasInsightsKeyword && !hasTransactionKeyword;
+}
+
 function parseReceiptDetails(receiptText?: string): Record<string, string> {
   const details: Record<string, string> = {};
   if (!receiptText) return details;
@@ -218,6 +282,50 @@ function mergeIntentData(fallbackParsed: IntentData, parsedByLlm: IntentData): I
   };
 }
 
+
+async function resolveTransferStatementAmbiguity(intentData: IntentData, message: string): Promise<IntentData> {
+  const hasTransferDetails = Boolean(
+    intentData.amount ||
+    intentData.recipientAccount ||
+    asAmount(message) ||
+    asAccountNumber(message)
+  );
+
+  if (hasTransferDetails) return intentData;
+  if (intentData.intent !== "transfer" && intentData.intent !== "unknown") return intentData;
+
+  try {
+    const result = await generateText({
+      model: getChatModel(),
+      prompt:
+        "Return ONLY compact JSON with one key: intent. " +
+        "intent must be one of: mini_statement, transfer, unknown. " +
+        "Classify by meaning, not exact keywords. " +
+        "If the customer is asking to VIEW or CHECK transaction records/history/statement (including transfer records), return mini_statement. " +
+        "If the customer is asking to EXECUTE or SEND a new transfer, return transfer. " +
+        "If ambiguous, return unknown.\n\n" +
+        `Message: ${message}`,
+    });
+
+    const parsed = safeParseIntent(result.text).intent;
+    if (parsed === "mini_statement") return { ...intentData, intent: "mini_statement" };
+    if (parsed === "transfer") return { ...intentData, intent: "transfer" };
+    return intentData;
+  } catch {
+    return intentData;
+  }
+}
+
+
+function buildTransferDetailsChecklist(): string {
+  return (
+    "Please provide the following to continue your transfer:\n" +
+    "1. Amount to send\n" +
+    "2. Recipient account number\n" +
+    "3. Description / narration (optional, e.g. \"for food\", \"for transport\")."
+  );
+}
+
 function safeParseConfirmationDecision(text: string): ConfirmationDecision {
   const candidates: string[] = [text];
 
@@ -258,9 +366,9 @@ async function interpretPendingDecision(params: {
       prompt:
         "Return ONLY compact JSON with one key: decision. " +
         "decision must be one of: proceed, cancel, unclear. " +
-        "Interpret natural customer language in an in-progress banking confirmation. " +
-        "Treat natural go-ahead replies like sure, yes, proceed, go ahead, do it, that is fine, continue, okay as proceed. " +
-        "Treat natural stop replies like no, cancel, stop, leave it, not now, abort, end this as cancel. " +
+        "Interpret natural customer language in an in-progress banking confirmation semantically, not by exact keywords. " +
+        "Support typos, slang, short replies, and conversational phrasing. " +
+        "If the user clearly wants to continue, return proceed. If they clearly want to stop, return cancel. " +
         "If the message is a question, unrelated, ambiguous, or changes topic without clearly cancelling the active confirmation, return unclear.\n\n" +
         `Flow: ${params.flowAction}\n` +
         `Stage: ${params.stage}\n` +
@@ -353,7 +461,10 @@ const understandMessageStep = createStep({
       });
 
       const intentData = safeParseIntent(result.text);
-      mergedIntentData = mergeIntentData(fallbackParsed, intentData);
+      mergedIntentData = await resolveTransferStatementAmbiguity(
+        mergeIntentData(fallbackParsed, intentData),
+        inputData.message
+      );
 
       if (mergedIntentData.intent === "unknown") {
         const coarseIntent = await inferCoarseIntent(inputData.message);
@@ -362,6 +473,7 @@ const understandMessageStep = createStep({
             ...mergedIntentData,
             intent: coarseIntent,
           };
+          mergedIntentData = await resolveTransferStatementAmbiguity(mergedIntentData, inputData.message);
         }
       }
     } catch {
@@ -374,6 +486,7 @@ const understandMessageStep = createStep({
             ...mergedIntentData,
             intent: coarseIntent,
           };
+          mergedIntentData = await resolveTransferStatementAmbiguity(mergedIntentData, inputData.message);
         }
       }
     }
@@ -459,6 +572,16 @@ const executeConversationFlowStep = createStep({
     const ended = await terminateFlowIfRequested();
     if (ended) return ended;
 
+
+    // =====================================================
+    // Let supervisor route clear insights/chart/budget/credit intents.
+    if (!pending && shouldBypassTransactionRouting(trimmedMessage)) {
+      return {
+        handled: true,
+        reply: TRANSACTION_UNKNOWN_REPLY,
+      };
+    }
+
     if (!pending && /^(ok|okay|alright|fine|thanks|thank you|cool|sure)$/i.test(trimmedMessage)) {
       return {
         handled: true,
@@ -473,9 +596,19 @@ const executeConversationFlowStep = createStep({
       };
     }
 
+    // =============================================
+
+
+
     const runBalance = async (pin?: string) => {
       const result = await (balanceEnquiryTool as any).execute({ phone, pin });
-      if (!result?.found) {
+      
+      const safeBalanceError =
+        typeof result?.error === "string" && result.error.trim().length > 0
+          ? result.error
+          : "Unable to fetch balance right now.";
+      
+          if (!result?.found) {
         if (result?.pinCreationRequired) {
           // PIN creation is mandatory before balance inquiry
           await setPendingFlow(phone, {
@@ -508,7 +641,7 @@ const executeConversationFlowStep = createStep({
         }
         return {
           handled: true,
-          reply: result?.error || "Unable to fetch balance right now.",
+          reply: safeBalanceError,
         };
       }
       await clearPendingFlow(phone).catch(() => {});
@@ -529,15 +662,21 @@ const executeConversationFlowStep = createStep({
       };
     };
 
-    const runStatement = async (pin?: string) => {
-      const result = await (miniStatementTool as any).execute({ phone, pin, limit: 10 });
+    const runStatement = async (pin?: string, requestedLimit = 10) => {
+      const statementLimit = Math.min(20, Math.max(1, Number(requestedLimit || 10)));
+      const result = await (miniStatementTool as any).execute({ phone, pin, limit: statementLimit });
+      const safeStatementError =
+        typeof result?.error === "string" && result.error.trim().length > 0
+          ? result.error
+          : "Unable to fetch mini statement right now.";
+
       if (!result?.found) {
         if (result?.pinCreationRequired) {
           // PIN creation is mandatory before statement retrieval
           await setPendingFlow(phone, {
             action: "mini_statement",
             step: "awaiting_new_pin",
-            data: { intent: "mini_statement" },
+            data: { intent: "mini_statement", statementLimit },
             started_at: new Date().toISOString(),
           });
           return {
@@ -554,30 +693,37 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: "mini_statement",
             step: "awaiting_pin",
-            data: { intent: "mini_statement" },
+            data: { intent: "mini_statement", statementLimit },
             started_at: new Date().toISOString(),
           });
         }
-        return { handled: true, reply: result?.error || "Unable to fetch mini statement right now." };
+        return { handled: true, reply: safeStatementError };
       }
       await clearPendingFlow(phone).catch(() => {});
-      const lines = (result.transactions || []).slice(0, 10).map((txn: any) => {
+
+      const txns = (result.transactions || []).slice(0, statementLimit);
+      if (!txns.length) {
+        return {
+          handled: true,
+          reply: `No transactions found in your last ${statementLimit} records.`,
+        };
+      }
+
+      const lines = txns.map((txn: any) => {
         const dateText = new Date(txn.date).toLocaleString("en-NG", {
           dateStyle: "medium",
           timeStyle: "short",
           timeZone: "Africa/Lagos",
         });
-        return `• ${dateText}\n  ${txn.description || txn.type} — ${money(Number(txn.amount || 0))}\n  Ref: ${txn.reference || "N/A"}`;
+        const direction = String(txn.type || "").toLowerCase().includes("debit") ? "🔴 Debit" : "🟢 Credit";
+        const description = txn.description || txn.type || "Transaction";
+        return `• ${dateText}\n  ${direction} — ${description}\n  Amount: ${money(Number(txn.amount || 0))}\n  Ref: ${txn.reference || "N/A"}`;
       });
       return {
         handled: true,
-        reply: await composeConversationalReply({
-          purpose: "summarize the customer's mini statement",
-          details: {
-            account: result.maskedAccount || "N/A",
-            transactions: lines.length ? lines.join(" | ") : "No recent transactions found",
-          },
-        }),
+        reply:
+          `Last ${txns.length} transactions — A/C: ${result.maskedAccount || "N/A"}\n` +
+          `${lines.join("\n\n")}`,
       };
     };
 
@@ -637,6 +783,7 @@ const executeConversationFlowStep = createStep({
           `2. Recipient name: ${recipient.accountName || "Recipient"}\n` +
           `3. Recipient bank: ${recipient.bankName || "Unknown Bank"}\n` +
           `4. Recipient account: ${maskAccount(params.recipientAccount)}\n` +
+          `5. Description: ${params.narration || "Transfer"}\n` +
           "If this looks right, reply naturally to continue, or say cancel if you want to stop.",
       };
     };
@@ -829,7 +976,9 @@ const executeConversationFlowStep = createStep({
         await clearPendingFlow(phone).catch(() => {});
         
         // Now proceed with the original transaction
-        return pending.action === "balance" ? runBalance(pin) : runStatement(pin);
+        return pending.action === "balance"
+          ? await runBalance(pin)
+          : await runStatement(pin, Number((pending.data as any)?.statementLimit ?? 10));
       }
 
       if (step === "awaiting_pin") {
@@ -875,7 +1024,9 @@ const executeConversationFlowStep = createStep({
 
         // PIN verified - proceed with transaction
         await clearPendingFlow(phone).catch(() => {});
-        return pending.action === "balance" ? runBalance(pin) : runStatement(pin);
+        return pending.action === "balance"
+          ? await runBalance(pin)
+          : await runStatement(pin, Number((pending.data as any)?.statementLimit ?? 10));
       }
     }
 
@@ -893,18 +1044,13 @@ const executeConversationFlowStep = createStep({
         const resolvedAmount = Number(data.amount || 0) || intentData.amount || asAmount(message) || undefined;
         const resolvedRecipientAccount =
           (data.recipientAccount as string | undefined) || intentData.recipientAccount || asAccountNumber(message) || undefined;
+        const resolvedNarration =
+          asNarration(message) ||
+          intentData.narration ||
+          (data.narration as string | undefined) ||
+          "Transfer";
 
         if (!resolvedAmount || !resolvedRecipientAccount) {
-          const missing = !resolvedAmount && !resolvedRecipientAccount
-            ? "amount and recipient account number"
-            : !resolvedAmount
-              ? "amount"
-              : "recipient account number";
-
-          const missingLines: string[] = [];
-          if (!resolvedAmount) missingLines.push("1. Amount to send");
-          if (!resolvedRecipientAccount) missingLines.push(`${missingLines.length + 1}. Recipient account number`);
-
           await setPendingFlow(phone, {
             action: "transfer",
             step: "awaiting_transfer_details",
@@ -912,22 +1058,21 @@ const executeConversationFlowStep = createStep({
               ...data,
               amount: resolvedAmount,
               recipientAccount: resolvedRecipientAccount,
+              narration: resolvedNarration,
             },
             started_at: pending.started_at,
           });
 
-          return remindActiveFlow({
-            pendingAction: pending.action,
-            currentStep: step,
-            nextInstruction: `Please provide the following to continue your transfer:\n${missingLines.join("\n")}`,
-            fallback: `Please provide the following to continue your transfer:\n${missingLines.join("\n")}`,
-          });
+          return {
+            handled: true,
+            reply: `${buildTransferDetailsChecklist()}\nIf you want to cancel this request and switch topics, type END.`,
+          };
         }
 
         return beginTransferConfirmation({
           amount: Number(resolvedAmount),
           recipientAccount: String(resolvedRecipientAccount),
-          narration: data.narration,
+          narration: resolvedNarration,
           startedAt: pending.started_at,
         });
       }
@@ -1460,17 +1605,20 @@ const executeConversationFlowStep = createStep({
       }
     }
 
+    
     if (action === "balance") {
-      return runBalance(asFourDigits(intentData.pin) ?? undefined);
+      return await runBalance(asFourDigits(intentData.pin) ?? undefined);
     }
 
+
     if (action === "mini_statement") {
-      return runStatement(asFourDigits(intentData.pin) ?? undefined);
+      return await runStatement(asFourDigits(intentData.pin) ?? undefined, asTxnLimit(message) ?? 10);
     }
 
     if (action === "transfer") {
       const amount = intentData.amount || asAmount(message) || undefined;
       const recipientAccount = intentData.recipientAccount || asAccountNumber(message) || undefined;
+      const narration = asNarration(message) || intentData.narration || undefined;
       if (!amount || !recipientAccount) {
         await setPendingFlow(phone, {
           action: "transfer",
@@ -1478,31 +1626,21 @@ const executeConversationFlowStep = createStep({
           data: {
             amount,
             recipientAccount,
-            narration: intentData.narration || "Transfer",
+            narration,
           },
           started_at: new Date().toISOString(),
         });
 
-        const missing = !amount && !recipientAccount
-          ? "amount and recipient account number"
-          : !amount
-            ? "amount"
-            : "recipient account number";
-
-        const missingLines: string[] = [];
-        if (!amount) missingLines.push("1. Amount to send");
-        if (!recipientAccount) missingLines.push(`${missingLines.length + 1}. Recipient account number`);
-
         return {
           handled: true,
-          reply: "Please provide the following to continue your transfer:\n" + `${missingLines.join("\n")}`,
+          reply: buildTransferDetailsChecklist(),
         };
       }
 
       return beginTransferConfirmation({
         amount: Number(amount),
         recipientAccount: String(recipientAccount),
-        narration: intentData.narration,
+        narration,
       });
     }
 

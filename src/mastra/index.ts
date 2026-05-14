@@ -17,6 +17,7 @@ import { onboardingWorkflow } from "./workflows/onboarding-workflow.js";
 import { transactionWorkflow } from "./workflows/transaction-workflow.js";
 import { fraudAlertWorkflow } from "./workflows/fraud-alert-workflow.js";
 import { pinCheckWorkflow } from "./workflows/pin-workflow.js";
+import { insightsWorkflow } from "./workflows/insights-workflow.js";
 
 export const mastra = new Mastra({
   agents: {
@@ -30,6 +31,7 @@ export const mastra = new Mastra({
   workflows: {
     onboardingWorkflow,
     transactionWorkflow,
+    insightsWorkflow,
     fraudAlertWorkflow,
     pinCheckWorkflow,
   },

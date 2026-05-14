@@ -5,6 +5,7 @@ import { runMigrations } from "./db/migrate.js";
 import { handleIncomingMessage } from "./handlers/chat-handler.js";
 import { mastra } from "./mastra/index.js";
 import { TRANSACTION_UNKNOWN_REPLY, transactionWorkflow } from "./mastra/workflows/transaction-workflow.js";
+import { INSIGHTS_UNKNOWN_REPLY, insightsWorkflow } from "./mastra/workflows/insights-workflow.js";
 import { clearPendingFlow, getSessionState as loadSessionState } from "./utils/session-state.js";
 import { sanitizeAgentReply } from "./utils/sanitize-agent-reply.js";
 import { createKbDocsTable } from "./mastra/core/rag/db.js";
@@ -897,6 +898,26 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
       }
     }
 
+    // Run insights workflow before supervisor fallback to keep insights/chart behavior deterministic.
+    {
+      const run = await insightsWorkflow.createRun();
+      const wf = await run.start({
+        inputData: {
+          phone: phoneNorm,
+          message: message.trim(),
+        },
+      });
+
+      if (wf.status === "success" && wf.result.handled && wf.result.reply !== INSIGHTS_UNKNOWN_REPLY) {
+        return res.json({
+          success: true,
+          reply: sanitizeAgentReply(wf.result.reply),
+          phone: phoneNorm,
+          threadId,
+        });
+      }
+    }
+
     const supervisor = mastra.getAgent("bankingSupervisor");
 
     const messages: Array<{ role: "user" | "system"; content: string }> = [];
@@ -913,6 +934,32 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
     }
 
 
+    // ===============================
+
+    const greetingPattern = /^(hi|hello|hey|start|menu|help|what|how|good\s)/i;
+    const isGreeting = greetingPattern.test(message.trim());
+    if (isGreeting) {
+      messages.push({
+        role: "system",
+        content:
+          `CRITICAL INSTRUCTION — DO THIS NOW:\n` +
+          `The customer sent a greeting. You MUST output the main menu followed IMMEDIATELY by the options tag.\n` +
+          `Your response MUST end with this EXACT block (no exceptions):\n` +
+          `\n` +
+          `<options>\n` +
+          `1. Account & Transactions\n` +
+          `2. Onboarding & KYC\n` +
+          `3. Security\n` +
+          `4. Financial Insights\n` +
+          `5. Support & Help\n` +
+          `</options>\n` +
+          `\n` +
+          `Do NOT omit the <options> block. It is REQUIRED for the WhatsApp UI to work.`,
+      });
+    }
+    // =======================
+
+
     messages.push({ role: "user", content: message.trim() });
 
     // NOTE: toolsets are intentionally NOT injected here — supervisor must delegate
@@ -927,7 +974,27 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
 
     const reply = sanitizeAgentReply(response?.text?.trim() ?? "");
 
-    return res.json({ success: true, reply, phone: phoneNorm, threadId });
+
+    // ============================
+    // Server-side safety net: if greeting triggered but LLM omitted <options>, append it.
+    const MAIN_MENU_OPTIONS =
+      `\n<options>\n` +
+      `1. Account & Transactions\n` +
+      `2. Onboarding & KYC\n` +
+      `3. Security\n` +
+      `4. Financial Insights\n` +
+      `5. Support & Help\n` +
+      `</options>`;
+    const finalReply = isGreeting && !/<options>/i.test(reply)
+      ? `${reply}${MAIN_MENU_OPTIONS}`
+      : reply;
+    if (isGreeting && !/<options>/i.test(reply)) {
+      console.log(`[/api/agent/chat] Greeting detected but LLM omitted <options> — appending main menu options tag.`);
+    }
+// ====================================
+
+
+    return res.json({ success: true, reply: finalReply, phone: phoneNorm, threadId });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Internal error";
     console.error("[/api/agent/chat] Error:", err);

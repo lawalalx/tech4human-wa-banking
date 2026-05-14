@@ -4,11 +4,7 @@ import { Memory } from "@mastra/memory";
 import { getChatModel } from "../core/llm/provider.js";
 import { sharedPgStore } from "../core/db/shared-pg-store.js";
 import {
-  spendingInsightsTool,
-  creditScoreTool,
-  setBudgetTool,
-  auditLogTool,
-  transactionChartTool,
+  runInsightsWorkflowTool,
 } from "../tools/index.js";
 import { bankingWorkspace } from "../workspace.js";
 import { TokenLimiterProcessor } from "@mastra/core/processors";
@@ -29,6 +25,13 @@ export const insightsAgent = new Agent({
   You help customers understand their finances, optimise spending, save smarter, and improve their credit health.
   All insights are derived ONLY from the customer's own transaction history with ${bankName}.
 </role>
+
+<workflow_first>
+  - For every customer turn, call run-insights-workflow exactly once.
+  - Input must be phone=contextPhone and message=customer's latest message verbatim.
+  - If handled=true, return workflow reply exactly and stop.
+  - Do not bypass this workflow with ad-hoc tool chains.
+</workflow_first>
 
 <personality>
   - Encouraging and non-judgmental — money management is personal.
@@ -121,11 +124,7 @@ export const insightsAgent = new Agent({
 
   model: getChatModel(), // Use chat model for cost efficiency on analytics tasks
   tools: {
-    spendingInsightsTool,
-    creditScoreTool,
-    setBudgetTool,
-    auditLogTool,
-    transactionChartTool,
+    runInsightsWorkflowTool,
   },
   memory: new Memory({
     storage: sharedPgStore,
