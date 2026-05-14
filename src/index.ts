@@ -30,7 +30,7 @@ const PORT =
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "whatsapp_verify_2025";
 const BANK_NAME = process.env.BANK_NAME || "First Bank Nigeria";
-const URL = process.env.LOCAL_URL;
+const URL = process.env.REMOTE_URL;
 
 app.use(express.json());
 
