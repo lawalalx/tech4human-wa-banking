@@ -1,8 +1,11 @@
 import "dotenv/config";
 import { PgVector } from "@mastra/pg";
+import { LibSQLVector } from "@mastra/libsql";
 import { BANK_ID } from "./db.js";
+import { getDatabaseUrl, isSqliteDatabaseUrl, toLibSqlFileUrl } from "../../../config/database-url.js";
 
-if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
+const databaseUrl = getDatabaseUrl();
+const sqliteMode = isSqliteDatabaseUrl(databaseUrl);
 
 /**
  * Singleton PgVector store for this deployment.
@@ -13,8 +16,15 @@ if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
  */
 export const vectorStore = new PgVector({
   id: `banking-vector-${BANK_ID}`,
-  connectionString: process.env.DATABASE_URL,
+  connectionString: databaseUrl,
 });
+
+export const sqliteVectorStore = new LibSQLVector({
+  id: `banking-vector-sqlite-${BANK_ID}`,
+  url: toLibSqlFileUrl(databaseUrl),
+});
+
+export const activeVectorStore = sqliteMode ? sqliteVectorStore : vectorStore;
 
 /**
  * The vector index name for this tenant.
@@ -36,7 +46,7 @@ export const EMBEDDING_DIM = parseInt(process.env.PGVECTOR_EMBEDDING_DIM || "153
  */
 export async function initVectorIndex(): Promise<void> {
   try {
-    await vectorStore.createIndex({
+    await activeVectorStore.createIndex({
       indexName: INDEX_NAME,
       dimension: EMBEDDING_DIM,
     });

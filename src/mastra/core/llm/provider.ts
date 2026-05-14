@@ -71,8 +71,12 @@ export function getChatModel(modelName = process.env.OPENAI_MODEL || "gpt-4o-min
 
 
 export function getEmbeddingModel() {
-  return fastembed.base;
-}
+  const size = process.env.EMBEDDING_MODEL_SIZE || "base";
+
+  return size === "small"
+    ? fastembed.small
+    : fastembed.base;
+  }
 
 /**
  * Pre-warms the FastEmbed ONNX model so the first real upload

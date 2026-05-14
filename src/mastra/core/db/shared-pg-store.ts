@@ -1,17 +1,23 @@
 import "dotenv/config";
 import { PostgresStore } from "@mastra/pg";
+import { LibSQLStore } from "@mastra/libsql";
+import { getDatabaseUrl, isSqliteDatabaseUrl, toLibSqlFileUrl } from "../../../config/database-url.js";
 
-if (!process.env.DATABASE_URL) {
-  throw new Error("DATABASE_URL environment variable is required");
-}
+const databaseUrl = getDatabaseUrl();
+const sqliteMode = isSqliteDatabaseUrl(databaseUrl);
 
 /**
- * Singleton PostgresStore shared across all agents and the Mastra instance.
+ * Singleton shared storage adapter used by Mastra.
  * Avoids spinning up multiple connection pools which exhausts memory.
  */
-export const sharedPgStore = new PostgresStore({
-  id: "tech4human-pg-storage",
-  connectionString: process.env.DATABASE_URL,
-  // Keep pool small for memory efficiency
-  max: 5,
-});
+export const sharedPgStore = sqliteMode
+  ? new LibSQLStore({
+      id: "tech4human-libsql-storage",
+      url: toLibSqlFileUrl(databaseUrl),
+    })
+  : new PostgresStore({
+      id: "tech4human-pg-storage",
+      connectionString: databaseUrl,
+      // Keep pool small for memory efficiency
+      max: 5,
+    });

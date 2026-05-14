@@ -1039,6 +1039,12 @@ async function main() {
     process.exit(1);
   });
 
+
+  // if (process.env.NODE_ENV !== "production") {
+  //   warmUpEmbeddingModel().catch(console.error);
+  // }
+
+
   app.listen(PORT, () => {
     const orgId = process.env.BANK_ID || "default";
     console.log(`\n🏦 Tech4Human WhatsApp Banking Server`);
