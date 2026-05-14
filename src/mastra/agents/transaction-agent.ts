@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { Agent } from "@mastra/core/agent";
 import { Memory } from "@mastra/memory";
-import { getChatModel } from "../core/llm/provider.js";
+import { getChatModel, getEmbeddingModel } from "../core/llm/provider.js";
 import { sharedPgStore } from "../core/db/shared-pg-store.js";
 import {
   runTransactionWorkflowTool,
@@ -9,6 +9,7 @@ import {
 
 import { bankingWorkspace } from "../workspace.js";
 import { TokenLimiterProcessor } from "@mastra/core/processors";
+import { vectorStore } from "../core/rag/vector-store.js";
 
 const bankName = process.env.BANK_NAME || "First Bank Nigeria";
 
@@ -284,8 +285,14 @@ export const transactionAgent = new Agent({
     maxSteps: 1,
   },
   memory: new Memory({
-    storage: sharedPgStore,
-    options: { lastMessages: 30, generateTitle: false },
+    // storage: sharedPgStore,
+    embedder: getEmbeddingModel(),
+    vector: vectorStore,
+    options: { 
+      semanticRecall: true,
+      lastMessages: 30, 
+      generateTitle: false 
+    },
   }),
   workspace: bankingWorkspace,
 });

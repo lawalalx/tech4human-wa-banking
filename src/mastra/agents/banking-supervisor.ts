@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { Agent } from "@mastra/core/agent";
 import { Memory } from "@mastra/memory";
-import { getChatModel } from "../core/llm/provider.js";
+import { getChatModel, getEmbeddingModel } from "../core/llm/provider.js";
 import { sharedPgStore } from "../core/db/shared-pg-store.js";
 import { auditLogTool, updateNotificationPrefsTool, knowledgeBaseTool, lookupCustomerForOnboardingTool } from "../tools/index.js";
 
@@ -13,6 +13,7 @@ import { supportAgent } from "./support-agent.js";
 import { insightsAgent } from "./insights-agent.js";
 import { bankingWorkspace } from "../workspace.js";
 import { TokenLimiterProcessor } from "@mastra/core/processors";
+import { vectorStore } from "../core/rag/vector-store.js";
 
 const bankName = process.env.BANK_NAME || "First Bank Nigeria";
 const botName = process.env.BOT_NAME || "FBN Banking Assistant";
@@ -45,9 +46,9 @@ export const bankingSupervisor = new Agent({
         Example: if you write "1. Check balance  2. Transfer money", you MUST follow with:
         <options>[{"id":"1","title":"Check balance"},{"id":"2","title":"Transfer money"}]</options>
 
-      2. GREETINGS SHOW MENU — For plain greetings/openers like "hi", "hello", "hey", "start", or "menu",
-        respond with a warm greeting plus the FULL main menu and the <options> tag.
-        If the customer has explicit task intent (for example "balance" or "transfer"), route directly instead of menu.
+      2. GREETINGS SHOW MENU — ANY greeting or conversational opener MUST be answered with the FULL main menu and the <options> tag. This includes (but is not limited to): "hi", "hello", "hey", "good morning", "good afternoon", "good evening", "howdy", "what's up", "sup", "yo", "start", "menu", "help", "what can you do", or any similar opener with no clear banking intent.
+        Never reply to a greeting with just text — ALWAYS include the full numbered menu list and the <options> tag.
+        Exception: if the message combines a greeting WITH explicit task intent (e.g. "hi, check my balance"), route directly to the specialist without showing the menu.
 
       3. NO DIRECT MCP TOOL CALLS — You have NO permission to call banking data tools directly
         (e.g. get_customer_accounts, lookup_customer_by_phone, get_balance, get_transaction_history).
@@ -61,6 +62,10 @@ export const bankingSupervisor = new Agent({
         Use plain beautified text lines only.
 
       7. NO FLOW HALLUCINATION — Never claim a transaction, bill payment, OTP step, or pending request is in progress unless it is explicitly present in system context (for example a session resumption hint) or returned by a specialist agent in this turn.
+
+      8. BANKING SCOPE ONLY — You are a banking assistant. If the customer sends a message that is completely unrelated to banking, finance, or their account (e.g. food, recipes, weather, sports, health tips, entertainment, general knowledge) — and it is NOT a greeting (greetings are covered by rule 2 above) — do NOT engage with it at all. Reply with a single short, polite redirection — for example:
+        "I'm your First Bank banking assistant — I can only help with banking and account queries. What banking task can I help you with today?"
+        Do NOT answer the non-banking question. Do NOT discuss the topic. Redirect immediately and offer to help with banking.
     </MANDATORY_RULES>
 
     <delegation_strategy>
@@ -184,6 +189,8 @@ export const bankingSupervisor = new Agent({
       - "what can you do"
       - "start"
       - "menu"
+      - "good morning"
+      - "Or any other kind of greeting"
 
       Do NOT force customers through menu navigation if their intent is already obvious.
       A plain "hi" or "hello" should show the menu with options.
@@ -426,8 +433,11 @@ export const bankingSupervisor = new Agent({
   },
 
   memory: new Memory({
-    storage: sharedPgStore,
+    // storage: sharedPgStore,
+    embedder: getEmbeddingModel(),
+    vector: vectorStore,
     options: {
+      semanticRecall: true,
       lastMessages: 50, // Supervisor needs broader context for routing
       generateTitle: false,
     },

@@ -10,6 +10,29 @@ const TYPING_INTERVAL_MS = 8_000;
 // How long of a gap (ms) qualifies a customer as "returning" for resumption hints
 const RESUME_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
+const MAIN_MENU_REPLY =
+  `👋 Welcome to *FirstBank* WhatsApp Banking!\n\n` +
+  `I'm FirstBot. Here's what I can help you with today:\n\n` +
+  `[1] *Account & Transactions* — balance, transfers, bill payments\n` +
+  `[2] *Onboarding & KYC* — open account, verify identity, activate channel\n` +
+  `[3] *Security* — fraud alerts, block card, manage devices\n` +
+  `[4] *Financial Insights* — spending analysis, budget, credit score\n` +
+  `[5] *Support & Help* — FAQs, complaints, speak to an agent\n\n` +
+  `Just type what you need, or reply with a number.\n` +
+  `<options>[{"id":"1","title":"Account & Transactions"},{"id":"2","title":"Onboarding & KYC"},{"id":"3","title":"Security"},{"id":"4","title":"Financial Insights"},{"id":"5","title":"Support & Help"}]</options>`;
+
+function isGreetingOnlyMessage(input: string): boolean {
+  const text = input.trim().toLowerCase();
+  if (!text) return false;
+
+  // Greeting-only path: show menu when there is no explicit banking task.
+  const greetingOnlyPattern = /^(hi+|hello+|hey+|yo+|sup+|howdy|good\s+(morning|afternoon|evening)|start|menu|help|what\s+can\s+you\s+do)[!.?,\s]*$/i;
+  if (!greetingOnlyPattern.test(text)) return false;
+
+  const explicitBankingIntent = /\b(balance|transfer|send\s+money|statement|mini\s*statement|bill|airtime|data|kyc|bvn|nin|fraud|card|loan|budget|spending|support|complaint|ticket)\b/i;
+  return !explicitBankingIntent.test(text);
+}
+
 interface WhatsAppMessage {
   from: string;
   id: string;
@@ -101,6 +124,13 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
     const hasPendingTransactionFlow = ["balance", "mini_statement", "transfer", "bill_payment"].includes(
       String(pendingAction || "")
     );
+
+    if (!pendingAction && isGreetingOnlyMessage(userText)) {
+      await sendAgentReply(rawPhone, MAIN_MENU_REPLY);
+      console.log(`[ChatHandler] Greeting-only opener detected for ${maskPhone(phone)}; sent deterministic main menu.`);
+      return;
+    }
+
     if (hasPendingTransactionFlow) {
       const run = await transactionWorkflow.createRun();
       const wf = await run.start({

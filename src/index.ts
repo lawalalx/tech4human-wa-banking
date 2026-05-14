@@ -976,20 +976,23 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
 
 
     // ============================
-    // Server-side safety net: if greeting triggered but LLM omitted <options>, append it.
-    const MAIN_MENU_OPTIONS =
-      `\n<options>\n` +
-      `1. Account & Transactions\n` +
-      `2. Onboarding & KYC\n` +
-      `3. Security\n` +
-      `4. Financial Insights\n` +
-      `5. Support & Help\n` +
-      `</options>`;
-    const finalReply = isGreeting && !/<options>/i.test(reply)
-      ? `${reply}${MAIN_MENU_OPTIONS}`
-      : reply;
-    if (isGreeting && !/<options>/i.test(reply)) {
-      console.log(`[/api/agent/chat] Greeting detected but LLM omitted <options> — appending main menu options tag.`);
+    // Server-side safety net: for greeting-only openers, return a deterministic full menu.
+    const MAIN_MENU_FULL_REPLY =
+      `👋 Welcome to *${bankName}* WhatsApp Banking!\n\n` +
+      `I'm ${botName}. Here's what I can help you with today:\n\n` +
+      `[1] *Account & Transactions* — balance, transfers, bill payments\n` +
+      `[2] *Onboarding & KYC* — open account, verify identity, activate channel\n` +
+      `[3] *Security* — fraud alerts, block card, manage devices\n` +
+      `[4] *Financial Insights* — spending analysis, budget, credit score\n` +
+      `[5] *Support & Help* — FAQs, complaints, speak to an agent\n\n` +
+      `Just type what you need, or reply with a number.\n` +
+      `<options>[{"id":"1","title":"Account & Transactions"},{"id":"2","title":"Onboarding & KYC"},{"id":"3","title":"Security"},{"id":"4","title":"Financial Insights"},{"id":"5","title":"Support & Help"}]</options>`;
+    const greetingOnlyPattern = /^(hi+|hello+|hey+|yo+|sup+|howdy|good\s+(morning|afternoon|evening)|start|menu|help|what\s+can\s+you\s+do)[!.?,\s]*$/i;
+    const explicitBankingIntent = /\b(balance|transfer|send\s+money|statement|mini\s*statement|bill|airtime|data|kyc|bvn|nin|fraud|card|loan|budget|spending|support|complaint|ticket)\b/i;
+    const isGreetingOnly = greetingOnlyPattern.test(message.trim()) && !explicitBankingIntent.test(message.trim());
+    const finalReply = isGreetingOnly ? MAIN_MENU_FULL_REPLY : reply;
+    if (isGreetingOnly) {
+      console.log(`[/api/agent/chat] Greeting-only opener detected — sending deterministic full main menu.`);
     }
 // ====================================
 

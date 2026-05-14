@@ -91,18 +91,22 @@ function asFourDigits(value?: string): string | null {
 function asAmount(value?: string): number | null {
   if (!value) return null;
   const raw = value.trim().toLowerCase();
-  const compact = raw.replace(/[\s,]/g, "");
-  // Avoid treating account-number-like messages as transfer amounts.
-  if (/^\d{9,10}$/.test(compact)) return null;
-  const match = compact.match(/(\d+(?:\.\d+)?)(k|m)?/i);
-  if (!match) return null;
+  const matches = [...raw.matchAll(/(?:₦|ngn)?\s*(\d+(?:\.\d+)?)(k|m)?/gi)];
+  for (const match of matches) {
+    const numeric = match[1] || "";
+    const suffix = (match[2] || "").toLowerCase();
 
-  const base = Number(match[1]);
-  if (!Number.isFinite(base) || base <= 0) return null;
+    // Skip account-like tokens when there is no unit suffix.
+    if (!suffix && /^\d{9,10}$/.test(numeric)) continue;
 
-  const suffix = (match[2] || "").toLowerCase();
-  const multiplier = suffix === "m" ? 1_000_000 : suffix === "k" ? 1_000 : 1;
-  return Math.round(base * multiplier);
+    const base = Number(numeric);
+    if (!Number.isFinite(base) || base <= 0) continue;
+
+    const multiplier = suffix === "m" ? 1_000_000 : suffix === "k" ? 1_000 : 1;
+    return Math.round(base * multiplier);
+  }
+
+  return null;
 }
 
 function asOtp(value?: string): number | null {
@@ -139,6 +143,34 @@ function asTxnLimit(value?: string): number | null {
   const parsed = Number(match[1]);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return Math.min(20, Math.max(1, parsed));
+}
+
+function asStatementSearchTerm(value?: string): string | null {
+  if (!value) return null;
+  const text = value.trim();
+
+  const match =
+    text.match(/(?:transactions?|statement|history)\s+(?:on|for|about|regarding)\s+([a-z][a-z0-9\s,&-]{2,40})\??$/i) ||
+    text.match(/(?:have\s+i\s+made\s+any\s+transactions?\s+on\s+)([a-z][a-z0-9\s,&-]{2,40})\??$/i) ||
+    text.match(/(?:spent\s+on|spending\s+on)\s+([a-z][a-z0-9\s,&-]{2,40})\??$/i);
+
+  if (!match?.[1]) return null;
+
+  const term = match[1].trim().toLowerCase();
+  if (!term || term.length < 3) return null;
+
+  const ignoredTerms = new Set([
+    "transaction",
+    "transactions",
+    "statement",
+    "history",
+    "transfer",
+    "payment",
+    "account",
+  ]);
+
+  if (ignoredTerms.has(term)) return null;
+  return term;
 }
 
 function asNarration(value?: string): string | null {
@@ -319,11 +351,43 @@ async function resolveTransferStatementAmbiguity(intentData: IntentData, message
 
 function buildTransferDetailsChecklist(): string {
   return (
-    "Please provide the following to continue your transfer:\n" +
+    "Please share the details below to continue with your transfer:\n\n" +
     "1. Amount to send\n" +
     "2. Recipient account number\n" +
-    "3. Description / narration (optional, e.g. \"for food\", \"for transport\")."
+    "3. Description (optional, e.g. \"for food\", \"for rent\")\n\n" +
+    "Once I have this I will continue with your transfer. You can also say *cancel* to stop this request."
   );
+}
+
+function buildTransferDetailsFollowUp(params: {
+  amount?: number;
+  recipientAccount?: string;
+  narration?: string;
+}): string {
+  const missing: string[] = [];
+  if (!params.amount) missing.push("amount to send");
+  if (!params.recipientAccount) missing.push("recipient account number");
+
+  if (!missing.length) {
+    return "Thanks. I have what I need to continue this transfer.";
+  }
+
+  // First-time ask — nothing collected yet, use the structured checklist for clarity.
+  if (!params.amount && !params.recipientAccount) {
+    return buildTransferDetailsChecklist();
+  }
+
+  // Follow-up ask — some data already captured, remind only what is still missing.
+  const updates: string[] = [];
+  if (params.amount) updates.push(`Amount noted: ${money(Number(params.amount))}.`);
+  if (params.recipientAccount) updates.push(`Recipient account noted: ${maskAccount(String(params.recipientAccount))}.`);
+  if (params.narration) updates.push(`Description noted: ${params.narration}.`);
+
+  const missingText =
+    missing.length === 1 ? missing[0] : `${missing.slice(0, -1).join(", ")} and ${missing[missing.length - 1]}`;
+
+  const prefix = updates.length ? `${updates.join(" ")} ` : "";
+  return `${prefix}Still need your ${missingText} to proceed. You can also say *cancel* to stop this request.`;
 }
 
 function safeParseConfirmationDecision(text: string): ConfirmationDecision {
@@ -662,9 +726,11 @@ const executeConversationFlowStep = createStep({
       };
     };
 
-    const runStatement = async (pin?: string, requestedLimit = 10) => {
+    const runStatement = async (pin?: string, requestedLimit = 10, requestedQuery?: string) => {
       const statementLimit = Math.min(20, Math.max(1, Number(requestedLimit || 10)));
-      const result = await (miniStatementTool as any).execute({ phone, pin, limit: statementLimit });
+      const statementQuery = (requestedQuery || "").trim().toLowerCase() || undefined;
+      const fetchLimit = statementQuery ? 20 : statementLimit;
+      const result = await (miniStatementTool as any).execute({ phone, pin, limit: fetchLimit });
       const safeStatementError =
         typeof result?.error === "string" && result.error.trim().length > 0
           ? result.error
@@ -676,7 +742,7 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: "mini_statement",
             step: "awaiting_new_pin",
-            data: { intent: "mini_statement", statementLimit },
+            data: { intent: "mini_statement", statementLimit, statementQuery },
             started_at: new Date().toISOString(),
           });
           return {
@@ -693,7 +759,7 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: "mini_statement",
             step: "awaiting_pin",
-            data: { intent: "mini_statement", statementLimit },
+            data: { intent: "mini_statement", statementLimit, statementQuery },
             started_at: new Date().toISOString(),
           });
         }
@@ -701,8 +767,22 @@ const executeConversationFlowStep = createStep({
       }
       await clearPendingFlow(phone).catch(() => {});
 
-      const txns = (result.transactions || []).slice(0, statementLimit);
+      const transactions = Array.isArray(result.transactions) ? result.transactions : [];
+      const matchedTransactions = statementQuery
+        ? transactions.filter((txn: any) => {
+            const haystack = `${txn?.description || ""} ${txn?.type || ""} ${txn?.reference || ""}`.toLowerCase();
+            return haystack.includes(statementQuery);
+          })
+        : transactions;
+
+      const txns = matchedTransactions.slice(0, statementLimit);
       if (!txns.length) {
+        if (statementQuery) {
+          return {
+            handled: true,
+            reply: `I could not find any transactions matching "${statementQuery}" in your recent history. You can try another keyword or ask for your last ${statementLimit} transactions.`,
+          };
+        }
         return {
           handled: true,
           reply: `No transactions found in your last ${statementLimit} records.`,
@@ -722,7 +802,7 @@ const executeConversationFlowStep = createStep({
       return {
         handled: true,
         reply:
-          `Last ${txns.length} transactions — A/C: ${result.maskedAccount || "N/A"}\n` +
+          `${statementQuery ? `Transactions matching "${statementQuery}"` : `Last ${txns.length} transactions`} — A/C: ${result.maskedAccount || "N/A"}\n` +
           `${lines.join("\n\n")}`,
       };
     };
@@ -880,11 +960,7 @@ const executeConversationFlowStep = createStep({
           : "📲 An OTP has been sent to your registered phone number. Please enter it to authorize the payment.";
       return {
         handled: true,
-        reply: await composeConversationalReply({
-          purpose: "tell the customer that the OTP has been sent",
-          details: { flowAction },
-          requiredSuffix: otpPrompt,
-        }),
+        reply: otpPrompt,
       };
     };
 
@@ -978,7 +1054,11 @@ const executeConversationFlowStep = createStep({
         // Now proceed with the original transaction
         return pending.action === "balance"
           ? await runBalance(pin)
-          : await runStatement(pin, Number((pending.data as any)?.statementLimit ?? 10));
+          : await runStatement(
+              pin,
+              Number((pending.data as any)?.statementLimit ?? 10),
+              String((pending.data as any)?.statementQuery || "")
+            );
       }
 
       if (step === "awaiting_pin") {
@@ -1026,7 +1106,11 @@ const executeConversationFlowStep = createStep({
         await clearPendingFlow(phone).catch(() => {});
         return pending.action === "balance"
           ? await runBalance(pin)
-          : await runStatement(pin, Number((pending.data as any)?.statementLimit ?? 10));
+          : await runStatement(
+              pin,
+              Number((pending.data as any)?.statementLimit ?? 10),
+              String((pending.data as any)?.statementQuery || "")
+            );
       }
     }
 
@@ -1065,7 +1149,11 @@ const executeConversationFlowStep = createStep({
 
           return {
             handled: true,
-            reply: `${buildTransferDetailsChecklist()}\nIf you want to cancel this request and switch topics, type END.`,
+            reply: buildTransferDetailsFollowUp({
+              amount: resolvedAmount,
+              recipientAccount: resolvedRecipientAccount,
+              narration: resolvedNarration,
+            }),
           };
         }
 
@@ -1078,6 +1166,33 @@ const executeConversationFlowStep = createStep({
       }
 
       if (step === "awaiting_transfer_confirmation") {
+        // Check if the message contains narration to update the transfer description
+        const extractedNarration = asNarration(message);
+        if (extractedNarration) {
+          // Update the narration and show the updated summary without re-confirming
+          await setPendingFlow(phone, {
+            action: "transfer",
+            step: "awaiting_transfer_confirmation",
+            data: {
+              ...data,
+              narration: extractedNarration,
+            },
+            started_at: pending.started_at,
+          });
+
+          return {
+            handled: true,
+            reply:
+              "Transfer summary updated:\n" +
+              `1. Amount: ${money(Number(data.amount || 0))}\n` +
+              `2. Recipient name: ${data.recipientName || "Recipient"}\n` +
+              `3. Recipient bank: ${data.recipientBank || "Unknown Bank"}\n` +
+              `4. Recipient account: ${maskAccount(String(data.recipientAccount || ""))}\n` +
+              `5. Description: ${extractedNarration}\n` +
+              "Reply naturally to complete this transfer, or say cancel to stop.",
+          };
+        }
+
         const decision = await interpretPendingDecision({
           message,
           flowAction: "transfer",
@@ -1228,23 +1343,13 @@ const executeConversationFlowStep = createStep({
 
         return {
           handled: true,
-          reply: await composeConversationalReply({
-            purpose: "ask the customer to final-confirm the transfer after OTP verification",
-            details: {
-              amount: money(Number(data.amount || 0)),
-              recipient: data.recipientName || "Recipient",
-              recipientBank: data.recipientBank || "Unknown Bank",
-              account: maskAccount(String(data.recipientAccount || "")),
-              otpStatus: "already_verified",
-            },
-            requiredSuffix:
-              "Security check complete. OTP is already verified.\n" +
-              `1. Amount: ${money(Number(data.amount || 0))}\n` +
-              `2. Recipient name: ${data.recipientName || "Recipient"}\n` +
-              `3. Recipient bank: ${data.recipientBank || "Unknown Bank"}\n` +
-              `4. Recipient account: ${maskAccount(String(data.recipientAccount || ""))}\n` +
-              "If you want me to complete this transfer now, reply naturally. If you want to stop, say cancel.",
-          }),
+          reply:
+            "Security check complete. OTP verified.\n" +
+            `1. Amount: ${money(Number(data.amount || 0))}\n` +
+            `2. Recipient name: ${data.recipientName || "Recipient"}\n` +
+            `3. Recipient bank: ${data.recipientBank || "Unknown Bank"}\n` +
+            `4. Recipient account: ${maskAccount(String(data.recipientAccount || ""))}\n` +
+            "Reply naturally to complete this transfer, or say cancel to stop.",
         };
       }
 
@@ -1612,7 +1717,11 @@ const executeConversationFlowStep = createStep({
 
 
     if (action === "mini_statement") {
-      return await runStatement(asFourDigits(intentData.pin) ?? undefined, asTxnLimit(message) ?? 10);
+      return await runStatement(
+        asFourDigits(intentData.pin) ?? undefined,
+        asTxnLimit(message) ?? 10,
+        asStatementSearchTerm(message) ?? undefined
+      );
     }
 
     if (action === "transfer") {
@@ -1633,7 +1742,7 @@ const executeConversationFlowStep = createStep({
 
         return {
           handled: true,
-          reply: buildTransferDetailsChecklist(),
+          reply: buildTransferDetailsFollowUp({ amount, recipientAccount, narration }),
         };
       }
 

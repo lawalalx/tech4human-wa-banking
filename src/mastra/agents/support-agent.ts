@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { Agent } from "@mastra/core/agent";
 import { Memory } from "@mastra/memory";
-import { getChatModel } from "../core/llm/provider.js";
+import { getChatModel, getEmbeddingModel } from "../core/llm/provider.js";
 import { sharedPgStore } from "../core/db/shared-pg-store.js";
 import {
   createEscalationTicketTool,
@@ -191,7 +191,8 @@ export const supportAgent = new Agent({
     deleteTicketTool,
   },
   memory: new Memory({
-    storage: sharedPgStore,
+    // storage: sharedPgStore,
+    embedder: getEmbeddingModel(),
     options: { lastMessages: 20, generateTitle: false },
   }),
 

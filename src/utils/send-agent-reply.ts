@@ -58,20 +58,20 @@ function parseOptions(text: string): { cleanText: string; options: Option[] | nu
 }
 
 export async function sendAgentReply(to: string, agentText: unknown): Promise<void> {
-  agentText = sanitizeAgentReply(agentText);
+  let text: string = sanitizeAgentReply(agentText);
 
   // ── 1. Chart URL — send image first, then remaining text ─────────────────
-  const { chartUrl, cleanText: afterChart } = parseChartUrl(agentText);
+  const { chartUrl, cleanText: afterChart } = parseChartUrl(text);
   if (chartUrl) {
     await sendWhatsAppImage(to, chartUrl).catch((err) => {
       console.error("[sendAgentReply] Failed to send chart image:", err);
     });
     if (!afterChart) return;
-    agentText = afterChart;
+    text = afterChart;
   }
 
   // ── 2. Parse <options> tag ────────────────────────────────────────────────
-  const { cleanText, options } = parseOptions(agentText);
+  const { cleanText, options } = parseOptions(text);
 
   if (options && options.length >= 2) {
     // Always use the interactive list (Select button) for 2+ options.
