@@ -155,8 +155,8 @@ export const sendPhoneVerificationOtpTool = createTool({
   description:
     "Send a verification OTP to the customer's WhatsApp/phone number to confirm ownership. " +
     "Call this after Terms & Conditions are accepted. " +
-    "Returns otpCode (store internally — use it to compare against the customer's reply). " +
-    "In production, the OTP is sent silently; only the otpCode is returned for verification.",
+    "IMPORTANT: Returns otpCode which MUST be stored in state for later verification. " +
+    "The OTP code is returned in the response and should be compared against the customer's reply.",
   inputSchema: z.object({
     phone: z.string().describe("Customer phone number (e.g. 2348012345678)"),
   }),

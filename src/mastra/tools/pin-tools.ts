@@ -150,13 +150,16 @@ export const verifyTransactionPinTool = createTool({
       message?: string;
       attempts_remaining?: number;
       blocked?: boolean;
-    }>("verify_pin", { customer_id: customerId, pin });
+       remaining_attempts?: number;
+       is_valid?: boolean;
+       error_code?: string;
+       }>("verify_pin", { customer_id: customerId, pin });
 
     const finalResult = {
-      verified: result.success,
+      verified: (result.is_valid ?? result.success) ?? false,
       message: result.message,
-      attemptsRemaining: result.attempts_remaining,
-      blocked: result.blocked ?? false,
+       attemptsRemaining: result.remaining_attempts ?? result.attempts_remaining,
+       blocked: result.blocked ?? false,
     };
 
     console.log(`[verifyTransactionPinTool] Result for customerId=${customerId}: verified=${finalResult.verified}, attemptsRemaining=${finalResult.attemptsRemaining}, blocked=${finalResult.blocked}`);

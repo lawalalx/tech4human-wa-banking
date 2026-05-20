@@ -4,15 +4,9 @@
  * Connects to the mcp_service_fb Python FastMCP server (SSE transport).
  * The server exposes real banking tools: customer lookup, balance, transfers,
  * PIN management, transaction history, bill payment, receipts, etc.
- *
- * Usage pattern (runtime injection into agent.generate):
- *   import { getBankingMcpToolsets } from "../core/mcp/banking-mcp-client.js";
- *   const toolsets = await getBankingMcpToolsets();
- *   const response = await agent.generate(messages, { memory: {...}, toolsets });
- *
- * The server must be running: uvicorn server:app --port 3001 (from mcp_service_fb/)
  */
 import { MCPClient } from "@mastra/mcp";
+import { getRequestContextPhone } from "../../../utils/request-context.js";
 
 const MCP_SERVICE_URL = process.env.MCP_SERVICE_URL;
 
@@ -28,63 +22,77 @@ export const bankingMcpClient = new MCPClient({
   },
 });
 
-// Cached toolsets — fetched on first call, reused afterwards.
 let _toolsets: Record<string, Record<string, any>> | null = null;
 
-/**
- * Returns Mastra toolsets from the MCP server, keyed by server name.
- * Caches on first successful load.
- * Returns {} gracefully if the MCP server is not reachable.
- */
 export async function getBankingMcpToolsets(): Promise<Record<string, Record<string, any>>> {
   if (_toolsets !== null) return _toolsets;
   try {
     _toolsets = await bankingMcpClient.listToolsets();
-    const toolCount = Object.values(_toolsets!).reduce((n, t) => n + Object.keys(t).length, 0);
-    console.log(`[BankingMCP] Connected to ${MCP_SERVICE_URL} — ${toolCount} tools loaded`);
+    const toolCount = Object.values(_toolsets).reduce((n, t) => n + Object.keys(t).length, 0);
+    console.log(`[BankingMCP] Connected to ${MCP_SERVICE_URL} - ${toolCount} tools loaded`);
   } catch (err) {
-    console.warn("[BankingMCP] MCP server not reachable — agents will use built-in tools only.", err instanceof Error ? err.message : err);
+    console.warn(
+      "[BankingMCP] MCP server not reachable - agents will use built-in tools only.",
+      err instanceof Error ? err.message : err
+    );
     _toolsets = {};
   }
-  return _toolsets!;
+  return _toolsets;
 }
 
-/**
- * Force-refresh the cached toolsets (useful after MCP server restarts).
- */
 export function invalidateMcpCache(): void {
   _toolsets = null;
 }
 
-/**
- * Call a single MCP tool programmatically from TypeScript code (e.g. from within
- * another Mastra tool's execute function).
- *
- * This is used by transaction-tools.ts and insights-tools.ts so that sub-agents
- * always use real MCP data rather than the mock core-banking.ts functions.
- *
- * Usage:
- *   const result = await callBankingTool<{ found: boolean; customer_id?: number }>(
- *     "lookup_customer_by_phone", { phone_number: "2348012345678" }
- *   );
- */
+function sanitizeToolArgs(toolName: string, args: Record<string, unknown>): Record<string, unknown> {
+  const placeholderPattern = /^(contextphone|\{\{\s*contextphone\s*\}\}|phone_from_context|customer_phone)$/i;
+  const phoneKeys = new Set(["phone", "phone_number", "customer_phone", "whatsapp_phone"]);
+  const contextPhone = getRequestContextPhone();
+
+  const out: Record<string, unknown> = { ...args };
+  for (const [key, rawValue] of Object.entries(out)) {
+    if (typeof rawValue !== "string") continue;
+    const value = rawValue.trim();
+    const keyLc = String(key).toLowerCase();
+
+    if (phoneKeys.has(keyLc) && placeholderPattern.test(value)) {
+      if (contextPhone) {
+        out[key] = contextPhone;
+      } else {
+        throw new Error(
+          `[BankingMCP] Unresolved phone placeholder for '${toolName}.${key}'. Ensure request context includes the customer phone.`
+        );
+      }
+      continue;
+    }
+
+    if (phoneKeys.has(keyLc)) {
+      out[key] = value;
+    }
+  }
+
+  return out;
+}
+
 export async function callBankingTool<T = unknown>(
   toolName: string,
   args: Record<string, unknown>
 ): Promise<T> {
+  const safeArgs = sanitizeToolArgs(toolName, args || {});
   const toolsets = await getBankingMcpToolsets();
   const serverTools = toolsets["firstbank"];
 
-  console.log(`\n[BankingMCP] Calling tool '${toolName}' with args:`, args);
-  
+  console.log(`\n[BankingMCP] Calling tool '${toolName}' with args:`, safeArgs);
+
   if (!serverTools) {
-    throw new Error('[BankingMCP] Server "firstbank" not found in toolsets — is mcp_service_fb running?');
+    throw new Error('[BankingMCP] Server "firstbank" not found in toolsets - is mcp_service_fb running?');
   }
+
   const tool = serverTools[toolName];
   if (!tool) {
     throw new Error(`[BankingMCP] Tool '${toolName}' not found. Available: ${Object.keys(serverTools).join(", ")}`);
   }
-  // Mastra tool execute(input, context) — context is optional
-  const result = await (tool as any).execute(args, {});
+
+  const result = await (tool as any).execute(safeArgs, {});
   return result as T;
 }

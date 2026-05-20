@@ -5,15 +5,19 @@ import { runMigrations } from "./db/migrate.js";
 import { handleIncomingMessage } from "./handlers/chat-handler.js";
 import { mastra } from "./mastra/index.js";
 import { TRANSACTION_UNKNOWN_REPLY, transactionWorkflow } from "./mastra/workflows/transaction-workflow.js";
-import { INSIGHTS_UNKNOWN_REPLY, insightsWorkflow } from "./mastra/workflows/insights-workflow.js";
-import { clearPendingFlow, getSessionState as loadSessionState } from "./utils/session-state.js";
 import { sanitizeAgentReply } from "./utils/sanitize-agent-reply.js";
 import { createKbDocsTable } from "./mastra/core/rag/db.js";
 import { initVectorIndex } from "./mastra/core/rag/vector-store.js";
 import kbUploadRoute from "./mastra/core/rag/routes/upload.route.js";
 import kbDocsRoute from "./mastra/core/rag/routes/docs.route.js";
-import { getBankingMcpToolsets } from "./mastra/core/mcp/banking-mcp-client.js";
 import { warmUpEmbeddingModel } from "./mastra/core/llm/provider.js";
+import { stateManager } from "./core/index.js";
+import {
+  buildSystemPrompt,
+  buildUserContextPrompt,
+} from "./services/conversation-context.js";
+import { analyzePersonalMemoryTurn, renderProfileMemoryReply } from "./services/personal-memory.js";
+import { runWithRequestContext } from "./utils/request-context.js";
 
 const app = express();
 const args = process.argv;
@@ -30,6 +34,7 @@ const PORT =
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "whatsapp_verify_2025";
 const BANK_NAME = process.env.BANK_NAME || "First Bank Nigeria";
+const BOT_NAME = process.env.BOT_NAME || "FBN Banking Assistant";
 const URL = process.env.LOCAL_URL;
 
 app.use(express.json());
@@ -846,76 +851,51 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
     }
 
     const phoneNorm = phone?.trim() || "test-user";
+    const normalizedMessage = message.trim();
     const threadId = `thread_${phoneNorm}`;
+    let state = await stateManager.getOrCreateState(phoneNorm);
+    state = await stateManager.processMessage(state, normalizedMessage);
+    const extractedContext = stateManager.extractContext(state);
 
-    if (/^end$/i.test(message.trim())) {
-      await clearPendingFlow(phoneNorm).catch(() => {});
+    const respond = async (rawReply: string) => {
+      const safeReply = sanitizeAgentReply(rawReply);
+      state = await stateManager.recordResponse(state, safeReply);
+      await stateManager.saveState(state);
+      return res.json({ success: true, reply: safeReply, phone: phoneNorm, threadId });
+    };
+
+    const personalMemoryTurn = await analyzePersonalMemoryTurn(normalizedMessage).catch(() => ({ intent: "none" as const }));
+    if (personalMemoryTurn.intent === "save_profile") {
+      const known = (state.persistent.knowledge || {}) as Record<string, unknown>;
+      const mergedName = String(personalMemoryTurn.name || known.preferred_name || "").trim() || undefined;
+      const mergedLocation = String(personalMemoryTurn.location || known.location || "").trim() || undefined;
+      state.persistent.knowledge = {
+        ...known,
+        preferred_name: mergedName,
+        location: mergedLocation,
+      };
+      await stateManager.saveState(state);
     }
 
-    const session = await loadSessionState(phoneNorm).catch(() => null);
-    const pendingAction = session?.pending_flow?.action;
-    const hasPendingTransactionFlow = ["balance", "mini_statement", "transfer", "bill_payment"].includes(
-      String(pendingAction || "")
-    );
-    if (hasPendingTransactionFlow) {
+    if (personalMemoryTurn.intent === "recall_profile") {
+      const known = (state.persistent.knowledge || {}) as Record<string, unknown>;
+      const name = String(known.preferred_name || "").trim();
+      const location = String(known.location || "").trim();
+      return await respond(renderProfileMemoryReply({ name, location }));
+    }
+
+    const wf = await runWithRequestContext({ phone: phoneNorm }, async () => {
       const run = await transactionWorkflow.createRun();
-      const wf = await run.start({
-        inputData: {
-          phone: phoneNorm,
-          action: pendingAction as any,
-          message: message.trim(),
-        },
-      });
-
-      if (wf.status === "success" && wf.result.handled) {
-        return res.json({
-          success: true,
-          reply: sanitizeAgentReply(wf.result.reply),
-          phone: phoneNorm,
-          threadId,
-        });
-      }
-    }
-
-    // Try transaction workflow first for new incoming requests too.
-    // If workflow cannot classify as transaction, it returns the unknown sentinel and we fall back to supervisor.
-    {
-      const run = await transactionWorkflow.createRun();
-      const wf = await run.start({
+      return await run.start({
         inputData: {
           phone: phoneNorm,
           message: message.trim(),
         },
       });
+    });
 
-      if (wf.status === "success" && wf.result.handled && wf.result.reply !== TRANSACTION_UNKNOWN_REPLY) {
-        return res.json({
-          success: true,
-          reply: sanitizeAgentReply(wf.result.reply),
-          phone: phoneNorm,
-          threadId,
-        });
-      }
-    }
-
-    // Run insights workflow before supervisor fallback to keep insights/chart behavior deterministic.
-    {
-      const run = await insightsWorkflow.createRun();
-      const wf = await run.start({
-        inputData: {
-          phone: phoneNorm,
-          message: message.trim(),
-        },
-      });
-
-      if (wf.status === "success" && wf.result.handled && wf.result.reply !== INSIGHTS_UNKNOWN_REPLY) {
-        return res.json({
-          success: true,
-          reply: sanitizeAgentReply(wf.result.reply),
-          phone: phoneNorm,
-          threadId,
-        });
-      }
+    if (wf.status === "success" && wf.result.handled && wf.result.reply !== TRANSACTION_UNKNOWN_REPLY) {
+      return await respond(wf.result.reply);
     }
 
     const supervisor = mastra.getAgent("bankingSupervisor");
@@ -926,6 +906,18 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
       role: "system",
       content: `Customer phone: ${phoneNorm}. Use this phone number when calling account-lookup or balance tools — never ask the customer to provide their account number.`,
     });
+    messages.push({ role: "system", content: extractedContext.systemPrompt });
+    messages.push({ role: "system", content: buildSystemPrompt(state, BANK_NAME, BOT_NAME) });
+    const userCtx = buildUserContextPrompt(state);
+    if (userCtx?.trim()) {
+      messages.push({ role: "system", content: `Conversation context:\n${userCtx}` });
+    }
+    if (extractedContext.userContext?.trim()) {
+      messages.push({ role: "system", content: `Conversation context:\n${extractedContext.userContext}` });
+    }
+    if (extractedContext.relevantTools.length) {
+      messages.push({ role: "system", content: `Relevant tools for current context: ${extractedContext.relevantTools.join(", ")}.` });
+    }
     if (customerName) {
       messages.push({
         role: "system",
@@ -934,70 +926,23 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
     }
 
 
-    // ===============================
-
-    const greetingPattern = /^(hi|hello|hey|start|menu|help|what|how|good\s)/i;
-    const isGreeting = greetingPattern.test(message.trim());
-    if (isGreeting) {
-      messages.push({
-        role: "system",
-        content:
-          `CRITICAL INSTRUCTION — DO THIS NOW:\n` +
-          `The customer sent a greeting. You MUST output the main menu followed IMMEDIATELY by the options tag.\n` +
-          `Your response MUST end with this EXACT block (no exceptions):\n` +
-          `\n` +
-          `<options>\n` +
-          `1. Account & Transactions\n` +
-          `2. Onboarding & KYC\n` +
-          `3. Security\n` +
-          `4. Financial Insights\n` +
-          `5. Support & Help\n` +
-          `</options>\n` +
-          `\n` +
-          `Do NOT omit the <options> block. It is REQUIRED for the WhatsApp UI to work.`,
-      });
-    }
-    // =======================
-
-
     messages.push({ role: "user", content: message.trim() });
 
     // NOTE: toolsets are intentionally NOT injected here — supervisor must delegate
     // all banking operations to specialist sub-agents via agents{} delegation.
-    const response = await supervisor.generate(messages, {
-      memory: { 
-        thread: threadId, 
-        resource: phoneNorm,
-        
-      },
-    });
+    const response = await runWithRequestContext({ phone: phoneNorm }, async () =>
+      supervisor.generate(messages, {
+        memory: {
+          thread: threadId,
+          resource: phoneNorm,
+        },
+      })
+    );
 
-    const reply = sanitizeAgentReply(response?.text?.trim() ?? "");
-
-
-    // ============================
-    // Server-side safety net: for greeting-only openers, return a deterministic full menu.
-    const MAIN_MENU_FULL_REPLY =
-      `👋 Welcome to *${bankName}* WhatsApp Banking!\n\n` +
-      `I'm ${botName}. Here's what I can help you with today:\n\n` +
-      `[1] *Account & Transactions* — balance, transfers, bill payments\n` +
-      `[2] *Onboarding & KYC* — open account, verify identity, activate channel\n` +
-      `[3] *Security* — fraud alerts, block card, manage devices\n` +
-      `[4] *Financial Insights* — spending analysis, budget, credit score\n` +
-      `[5] *Support & Help* — FAQs, complaints, speak to an agent\n\n` +
-      `Just type what you need, or reply with a number.\n` +
-      `<options>[{"id":"1","title":"Account & Transactions"},{"id":"2","title":"Onboarding & KYC"},{"id":"3","title":"Security"},{"id":"4","title":"Financial Insights"},{"id":"5","title":"Support & Help"}]</options>`;
-    const greetingOnlyPattern = /^(hi+|hello+|hey+|yo+|sup+|howdy|good\s+(morning|afternoon|evening)|start|menu|help|what\s+can\s+you\s+do)[!.?,\s]*$/i;
-    const explicitBankingIntent = /\b(balance|transfer|send\s+money|statement|mini\s*statement|bill|airtime|data|kyc|bvn|nin|fraud|card|loan|budget|spending|support|complaint|ticket)\b/i;
-    const isGreetingOnly = greetingOnlyPattern.test(message.trim()) && !explicitBankingIntent.test(message.trim());
-    const finalReply = isGreetingOnly ? MAIN_MENU_FULL_REPLY : reply;
-    if (isGreetingOnly) {
-      console.log(`[/api/agent/chat] Greeting-only opener detected — sending deterministic full main menu.`);
-    }
-// ====================================
+    const reply = response?.text?.trim() ?? "";
 
 
-    return res.json({ success: true, reply: finalReply, phone: phoneNorm, threadId });
+    return await respond(reply);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Internal error";
     console.error("[/api/agent/chat] Error:", err);

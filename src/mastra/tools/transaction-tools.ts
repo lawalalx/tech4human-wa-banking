@@ -62,6 +62,8 @@ export const lookupCustomerByAccountTool = createTool({
     "Look up RECIPIENT/DESTINATION account details by account number. " +
     "ONLY use this to verify a transfer recipient — NOT for the sender/customer. " +
     "NEVER pass a phone number to this tool — it requires an actual bank account number. " +
+    "IMPORTANT: This tool ONLY takes account_number parameter (no bank_code). " +
+    "Bank name is automatically resolved from the account lookup response. " +
     "Returns whether the account exists, the associated account name, bank name, and customer ID. " +
     "This tool is used to verify recipient details before executing interbank transfers.",
   inputSchema: z.object({
@@ -73,22 +75,39 @@ export const lookupCustomerByAccountTool = createTool({
     customerId: z.number().optional(),
     message: z.string().optional(),
     bankName: z.string().optional(),
+    bankOptions: z.array(z.string()).optional(),
   }),
   execute: async ({ accountNumber }: { accountNumber: string }) => {
+    // FIXED: Only pass account_number, NOT bank_code
+    // Bank name is returned directly from MCP response
     const result = await callBankingTool<{
       found: boolean;
       customer_name?: string;
       customer_id?: number;
       message?: string;
       bank_name?: string;
-    }>("lookup_customer_by_account", { account_number: accountNumber });
+      bank_options?: string[];
+      possible_banks?: string[];
+      banks?: string[];
+    }>("lookup_customer_by_account", { 
+      account_number: accountNumber 
+    });
+
+    const bankOptions = Array.isArray(result.bank_options)
+      ? result.bank_options
+      : Array.isArray(result.possible_banks)
+      ? result.possible_banks
+      : Array.isArray(result.banks)
+      ? result.banks
+      : undefined;
 
     return {
       found: result.found ?? false,
       accountName: result.customer_name ?? undefined,
       customerId: result.customer_id,
       message: result.found ? undefined : result.message,
-      bankName: result.bank_name ?? undefined
+      bankName: result.bank_name ?? undefined,
+      bankOptions,
     };
   },
 });

@@ -1,4 +1,4 @@
-import { createWorkflow, createStep } from "@mastra/core/workflows";
+﻿import { createWorkflow, createStep } from "@mastra/core/workflows";
 import { z } from "zod";
 import { generateText } from "ai";
 import { getChatModel } from "../core/llm/provider.js";
@@ -15,12 +15,58 @@ import {
 import { checkHasPinTool, createTransactionPinTool, verifyTransactionPinTool } from "../tools/pin-tools.js";
 import { sendPhoneVerificationOtpTool, verifyPhoneVerificationOtpTool } from "../tools/onboarding-tools.js";
 import { clearPendingFlow, getSessionState, setPendingFlow } from "../../utils/session-state.js";
+import { stateManager } from "../../core/index.js";
+
+// ─────────────────────────────────────────────────────────────────────────
+// NEW SERVICES FOR PRODUCTION
+// ─────────────────────────────────────────────────────────────────────────
+import {
+  isPinExpired,
+  isOtpExpired,
+  verifyPinWithMcp,
+  verifyOtpCode,
+  getAuthorizationStatus,
+  resetAuthorizationState,
+  AuthorizationConfig,
+} from "../../services/authorization-service.js";
+
+import {
+  buildPinPrompt,
+  buildOtpPrompt,
+  buildTransactionConfirmation,
+  buildTransactionReceipt,
+  buildErrorMessage,
+} from "../../services/conversation-context.js";
+
+import {
+  resolveRecipientBank,
+  sendOtpToPhone,
+  verifyPinViaMcp,
+  updateTransactionContext,
+  updateOtpCode,
+  updatePinVerified,
+  updateOtpVerified,
+  incrementPinAttempts,
+  incrementOtpAttempts,
+} from "../../services/mcp-transaction-handler.js";
+
+// Authorization configuration (can be overridden via env)
+const AUTH_CONFIG: AuthorizationConfig = {
+  pinTimeoutMs: Number(process.env.PIN_TIMEOUT_MS || 2 * 60 * 1000),
+  otpTimeoutMs: Number(process.env.OTP_TIMEOUT_MS || 5 * 60 * 1000),
+  maxPinAttempts: Number(process.env.MAX_PIN_ATTEMPTS || 3),
+  maxOtpAttempts: Number(process.env.MAX_OTP_ATTEMPTS || 3),
+};
+
+console.log("[TransactionWorkflow] Authorization config:", AUTH_CONFIG);
 
 const intentSchema = z.object({
   intent: z.enum(["balance", "mini_statement", "transfer", "bill_payment", "unknown"]),
   affirm: z.boolean().default(false),
   cancel: z.boolean().default(false),
   resend: z.boolean().default(false),
+  summaryMode: z.enum(["none", "count"]).default("none"),
+  summaryFocus: z.enum(["all", "transfer", "bill_payment", "debit", "credit"]).optional(),
   pin: z.string().optional(),
   otp: z.number().optional(),
   amount: z.number().optional(),
@@ -64,11 +110,19 @@ function safeParseIntent(text: string): IntentData {
     affirm: false,
     cancel: false,
     resend: false,
+    summaryMode: "none",
+    summaryFocus: undefined,
   };
 }
 
 type IntentData = z.infer<typeof intentSchema>;
 type ConfirmationDecision = z.infer<typeof confirmationDecisionSchema>["decision"];
+
+const semanticIntentSchema = z.object({
+  intent: z.enum(["balance", "mini_statement", "transfer", "bill_payment", "unknown"]),
+  summaryMode: z.enum(["none", "count"]).default("none"),
+  summaryFocus: z.enum(["all", "transfer", "bill_payment", "debit", "credit"]).optional(),
+});
 
 const actionSchema = z.enum(["balance", "mini_statement", "transfer", "bill_payment"]);
 type TransactionAction = z.infer<typeof actionSchema>;
@@ -143,6 +197,34 @@ function asTxnLimit(value?: string): number | null {
   const parsed = Number(match[1]);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return Math.min(20, Math.max(1, parsed));
+}
+
+function asBillerName(value?: string): string | null {
+  if (!value) return null;
+  const text = value.toLowerCase();
+
+  const billers: Array<{ pattern: RegExp; name: string }> = [
+    { pattern: /\bdstv\b/i, name: "DSTV" },
+    { pattern: /\bgotv\b/i, name: "GOTV" },
+    { pattern: /\bstartimes\b/i, name: "Startimes" },
+    { pattern: /\belectricity\b|\bdisco\b|\bpower\b|\bmeter\b/i, name: "Electricity" },
+    { pattern: /\bairtime\b/i, name: "Airtime" },
+    { pattern: /\bdata\b/i, name: "Data" },
+    { pattern: /\bwater\b/i, name: "Water" },
+  ];
+
+  for (const item of billers) {
+    if (item.pattern.test(text)) return item.name;
+  }
+
+  const explicit = text.match(/(?:biller|provider|service)\s*[:=-]?\s*([a-z][a-z0-9\s&-]{2,30})/i);
+  if (explicit?.[1]) return explicit[1].trim();
+
+  return null;
+}
+
+function maskSensitiveNumericTokens(value: string): string {
+  return value.replace(/\b(\d{3})\d{3}(\d{4})\b/g, "$1***$2");
 }
 
 function asStatementSearchTerm(value?: string): string | null {
@@ -227,6 +309,105 @@ function shouldBypassTransactionRouting(message: string): boolean {
   return hasInsightsKeyword && !hasTransactionKeyword;
 }
 
+function detectTransactionActionHint(message: string): TransactionAction | "unknown" {
+  const text = (message || "").toLowerCase();
+
+  if (/\b(balance|available\s+balance|account\s+balance|remaining\s+balance|what\s+is\s+left|how\s+much\s+(do\s+i\s+have|is\s+left|is\s+remaining))\b/i.test(text)) {
+    return "balance";
+  }
+  if (/\b(statement|mini\s*statement|recent\s+transactions?|transaction\s+history|last\s+\d+\s+transactions?)\b/i.test(text)) {
+    return "mini_statement";
+  }
+  if (/\b(transfer|send\s+money|send\s+\d+|recipient\s+account|to\s+account|tr[a-z]*nsf[a-z]*)\b/i.test(text)) {
+    return "transfer";
+  }
+  if (/\b(pay\s*bill|bill\s*payment|airtime|data\s*bundle|electricity|dstv|gotv|meter)\b/i.test(text)) {
+    return "bill_payment";
+  }
+  return "unknown";
+}
+
+function detectSummaryCountRequest(message: string): {
+  summaryMode: "none" | "count";
+  summaryFocus?: "all" | "transfer" | "bill_payment" | "debit" | "credit";
+} {
+  const text = (message || "").toLowerCase();
+  const asksForCount = /\b(how\s+many|number\s+of|count)\b/i.test(text);
+  if (!asksForCount) {
+    return { summaryMode: "none" };
+  }
+
+  if (/\b(transfer|tr[a-z]*nsf[a-z]*)\b/i.test(text)) {
+    return { summaryMode: "count", summaryFocus: "transfer" };
+  }
+  if (/\b(bill|payment|dstv|gotv|airtime|data)\b/i.test(text)) {
+    return { summaryMode: "count", summaryFocus: "bill_payment" };
+  }
+  if (/\b(debit)\b/i.test(text)) {
+    return { summaryMode: "count", summaryFocus: "debit" };
+  }
+  if (/\b(credit)\b/i.test(text)) {
+    return { summaryMode: "count", summaryFocus: "credit" };
+  }
+
+  return { summaryMode: "count", summaryFocus: "all" };
+}
+
+function isLikelyContinuationInput(message: string): boolean {
+  const text = (message || "").trim().toLowerCase();
+  if (!text) return false;
+
+  if (/^(yes|yep|yeah|ok|okay|alright|sure|go\s*ahead|proceed|continue|do\s*it|cancel|stop|no|resend|end)$/i.test(text)) {
+    return true;
+  }
+
+  if (/^\d{4}$/.test(text)) return true; // PIN
+  if (/^\d{4,8}$/.test(text)) return true; // OTP
+
+  return false;
+}
+
+function looksLikeGeneralSupportQuery(message: string): boolean {
+  const text = (message || "").trim().toLowerCase();
+  if (!text) return false;
+
+  const transactionSignals = /\b(balance|statement|transfer|send\s+money|bill|airtime|data|pin|otp)\b/i;
+  const supportSignals = /\b(daily\s+transfer\s+limit|transfer\s+limit|speak\s+to\s+(a\s+)?human|human\s+agent|customer\s+care|complaint|ticket|support|faq)\b/i;
+
+  return supportSignals.test(text) && !transactionSignals.test(text);
+}
+
+function shouldInterruptPendingFlow(params: {
+  pendingAction: string;
+  pendingStep: string;
+  message: string;
+  intentData: IntentData;
+}): boolean {
+  const { pendingAction, pendingStep, message, intentData } = params;
+
+  if (isLikelyContinuationInput(message)) return false;
+  if (intentData.cancel || intentData.resend || intentData.affirm) return false;
+
+  const hintedAction = detectTransactionActionHint(message);
+  if (hintedAction !== "unknown" && hintedAction !== pendingAction) {
+    return true;
+  }
+
+  if (
+    pendingAction === "transfer" &&
+    (pendingStep === "awaiting_transfer_confirmation" || pendingStep === "awaiting_transfer_final_confirmation") &&
+    (Boolean(asAmount(message)) || Boolean(asAccountNumber(message)))
+  ) {
+    return true;
+  }
+
+  if (looksLikeGeneralSupportQuery(message)) {
+    return true;
+  }
+
+  return false;
+}
+
 function parseReceiptDetails(receiptText?: string): Record<string, string> {
   const details: Record<string, string> = {};
   if (!receiptText) return details;
@@ -276,17 +457,29 @@ function fallbackParseIntentData(message: string): IntentData {
   const amount = asAmount(text) ?? undefined;
   const recipientAccount = asAccountNumber(text) ?? undefined;
   const billReference = asBillReference(text) ?? undefined;
+  const billerName = asBillerName(text) ?? undefined;
+  const hintedIntent = detectTransactionActionHint(text);
+  const countRequest = detectSummaryCountRequest(text);
+
+  const fallbackIntent: IntentData["intent"] =
+    countRequest.summaryMode === "count"
+      ? "mini_statement"
+      : hintedIntent !== "unknown"
+        ? hintedIntent
+        : "unknown";
 
   return {
-    intent: "unknown",
+    intent: fallbackIntent,
     affirm: false,
     cancel: false,
     resend: false,
+    summaryMode: countRequest.summaryMode,
+    summaryFocus: countRequest.summaryFocus,
     pin,
     otp,
     amount,
     recipientAccount,
-    billerName: undefined,
+    billerName,
     billReference,
     narration: undefined,
   };
@@ -304,6 +497,8 @@ function mergeIntentData(fallbackParsed: IntentData, parsedByLlm: IntentData): I
     affirm: Boolean(parsedByLlm.affirm || fallbackParsed.affirm),
     cancel: Boolean(parsedByLlm.cancel || fallbackParsed.cancel),
     resend: Boolean(parsedByLlm.resend || fallbackParsed.resend),
+    summaryMode: parsedByLlm.summaryMode !== "none" ? parsedByLlm.summaryMode : fallbackParsed.summaryMode,
+    summaryFocus: parsedByLlm.summaryFocus || fallbackParsed.summaryFocus,
     pin: pick(parsedByLlm.pin, fallbackParsed.pin),
     otp: pick(parsedByLlm.otp, fallbackParsed.otp),
     amount: pick(parsedByLlm.amount, fallbackParsed.amount),
@@ -492,6 +687,31 @@ async function inferCoarseIntent(message: string): Promise<IntentData["intent"]>
   }
 }
 
+async function inferSemanticIntent(message: string): Promise<Pick<IntentData, "intent" | "summaryMode" | "summaryFocus">> {
+  try {
+    const result = await generateText({
+      model: getChatModel(),
+      prompt:
+        "Return ONLY compact JSON with keys: intent, summaryMode, summaryFocus. " +
+        "intent must be one of: balance, mini_statement, transfer, bill_payment, unknown. " +
+        "summaryMode must be one of: none, count. " +
+        "summaryFocus must be one of: all, transfer, bill_payment, debit, credit, or null. " +
+        "Classify by customer meaning and tolerate typos/slang. " +
+        "If the customer asks what is left in their account or available money, set intent=balance. " +
+        "If the customer asks how many transfers/transactions they have done, set intent=mini_statement, summaryMode=count, summaryFocus=transfer. " +
+        "If the user asks for spending summary, breakdown, chart, trends, or budget, return unknown so supervisor can route insights. " +
+        "No markdown, no prose, JSON only.\n\n" +
+        `Message: ${message}`,
+    });
+
+    const parsed = semanticIntentSchema.safeParse(safeParseIntent(result.text));
+    if (parsed.success) return parsed.data;
+    return { intent: "unknown", summaryMode: "none" };
+  } catch {
+    return { intent: "unknown", summaryMode: "none" };
+  }
+}
+
 const understandMessageStep = createStep({
   id: "understand-message",
   inputSchema: z.object({
@@ -514,8 +734,10 @@ const understandMessageStep = createStep({
         model: getChatModel(),
         prompt:
           "Return ONLY compact JSON for transaction intent classification with keys: " +
-          "intent, affirm, cancel, resend, pin, otp, amount, recipientAccount, billerName, billReference, narration. " +
+          "intent, affirm, cancel, resend, summaryMode, summaryFocus, pin, otp, amount, recipientAccount, billerName, billReference, narration. " +
           "intent must be one of: balance, mini_statement, transfer, bill_payment, unknown. " +
+          "If the customer asks what is left in their account, how much remains, available balance, or similar balance wording, set intent to balance. " +
+          "If the customer asks how many transfers or how many transactions they have done, set intent to mini_statement, summaryMode to count, and summaryFocus to transfer. " +
           "Interpret natural conversational approvals like sure, go ahead, that works, do it, and okay as affirm=true when they clearly mean proceed. " +
           "Interpret natural conversational cancellations like not now, stop this, leave it, cancel it, and never mind as cancel=true when they clearly mean stop. " +
           "If the message mentions a known biller or payment service, set billerName to the provider or service name mentioned by the customer. " +
@@ -540,6 +762,30 @@ const understandMessageStep = createStep({
           mergedIntentData = await resolveTransferStatementAmbiguity(mergedIntentData, inputData.message);
         }
       }
+
+      if (mergedIntentData.intent === "unknown" || mergedIntentData.intent === "mini_statement") {
+        const semanticIntent = await inferSemanticIntent(inputData.message);
+        if (semanticIntent.intent !== "unknown") {
+          mergedIntentData = {
+            ...mergedIntentData,
+            intent: semanticIntent.intent,
+            summaryMode: semanticIntent.summaryMode,
+            summaryFocus: semanticIntent.summaryFocus,
+          };
+        }
+      }
+
+      const hintedAction = detectTransactionActionHint(inputData.message);
+      if (
+        hintedAction !== "unknown" &&
+        (mergedIntentData.intent === "unknown" ||
+          (hintedAction === "balance" && mergedIntentData.intent === "mini_statement" && mergedIntentData.summaryMode === "none"))
+      ) {
+        mergedIntentData = {
+          ...mergedIntentData,
+          intent: hintedAction,
+        };
+      }
     } catch {
       mergedIntentData = fallbackParsed;
 
@@ -552,6 +798,30 @@ const understandMessageStep = createStep({
           };
           mergedIntentData = await resolveTransferStatementAmbiguity(mergedIntentData, inputData.message);
         }
+      }
+
+      if (mergedIntentData.intent === "unknown" || mergedIntentData.intent === "mini_statement") {
+        const semanticIntent = await inferSemanticIntent(inputData.message);
+        if (semanticIntent.intent !== "unknown") {
+          mergedIntentData = {
+            ...mergedIntentData,
+            intent: semanticIntent.intent,
+            summaryMode: semanticIntent.summaryMode,
+            summaryFocus: semanticIntent.summaryFocus,
+          };
+        }
+      }
+
+      const hintedAction = detectTransactionActionHint(inputData.message);
+      if (
+        hintedAction !== "unknown" &&
+        (mergedIntentData.intent === "unknown" ||
+          (hintedAction === "balance" && mergedIntentData.intent === "mini_statement" && mergedIntentData.summaryMode === "none"))
+      ) {
+        mergedIntentData = {
+          ...mergedIntentData,
+          intent: hintedAction,
+        };
       }
     }
 
@@ -580,13 +850,15 @@ const executeConversationFlowStep = createStep({
     const { phone, intentData } = inputData;
     const action = inputData.action || intentData.intent;
     const session = await getSessionState(phone).catch(() => null);
-    const pending = session?.pending_flow;
+    let pending = session?.pending_flow ?? undefined;
     const { message } = inputData;
     const trimmedMessage = message.trim();
     const isEndCommand = /^end$/i.test(trimmedMessage);
     // If there's a pending flow, use the raw message for PIN extraction.
     // This ensures "1234" is treated as PIN input, not parsed by LLM.
     const directPin = asFourDigits(message);
+    // Load agent state for authorization tracking and context services
+    let agentState = await stateManager.getOrCreateState(phone);
 
     const describeAction = (pendingAction: string): string => {
       if (pendingAction === "balance") return "balance request";
@@ -594,6 +866,26 @@ const executeConversationFlowStep = createStep({
       if (pendingAction === "transfer") return "transfer";
       if (pendingAction === "bill_payment") return "bill payment";
       return "current request";
+    };
+
+    const buildPinSetupData = (params: {
+      postPinIntent: "balance" | "mini_statement" | "transfer" | "bill_payment";
+      postPinStep?: string;
+      originalData?: Record<string, unknown>;
+      existingData?: Record<string, unknown>;
+    }) => {
+      return {
+        ...(params.existingData || {}),
+        ...(params.originalData || {}),
+        post_pin_intent: params.postPinIntent,
+        post_pin_step: params.postPinStep,
+        pending_pin_creation: true,
+        missing_params: ["pin", "confirm_pin"],
+      };
+    };
+
+    const prependPinCreatedMessage = (reply: string) => {
+      return `PIN created! Continuing your earlier request now.\n\n${reply}`;
     };
 
     const humanReply = async (params: {
@@ -635,6 +927,37 @@ const executeConversationFlowStep = createStep({
 
     const ended = await terminateFlowIfRequested();
     if (ended) return ended;
+
+    if (!pending && /^\d{4}$/.test(trimmedMessage)) {
+      return {
+        handled: true,
+        reply: TRANSACTION_UNKNOWN_REPLY,
+      };
+    }
+
+    if (
+      pending &&
+      shouldBypassTransactionRouting(trimmedMessage)
+    ) {
+      await clearPendingFlow(phone).catch(() => {});
+      return {
+        handled: true,
+        reply: TRANSACTION_UNKNOWN_REPLY,
+      };
+    }
+
+    if (
+      pending &&
+      shouldInterruptPendingFlow({
+        pendingAction: String(pending.action || ""),
+        pendingStep: String(pending.step || ""),
+        message: trimmedMessage,
+        intentData,
+      })
+    ) {
+      await clearPendingFlow(phone).catch(() => {});
+      pending = undefined;
+    }
 
 
     // =====================================================
@@ -714,6 +1037,7 @@ const executeConversationFlowStep = createStep({
         timeStyle: "short",
         timeZone: "Africa/Lagos",
       });
+      agentState = await stateManager.completeGoal(agentState);
       return {
         handled: true,
         reply:
@@ -726,10 +1050,15 @@ const executeConversationFlowStep = createStep({
       };
     };
 
-    const runStatement = async (pin?: string, requestedLimit = 10, requestedQuery?: string) => {
+    const runStatement = async (
+      pin?: string,
+      requestedLimit = 10,
+      requestedQuery?: string,
+      options?: { summaryMode?: "none" | "count"; summaryFocus?: "all" | "transfer" | "bill_payment" | "debit" | "credit" }
+    ) => {
       const statementLimit = Math.min(20, Math.max(1, Number(requestedLimit || 10)));
       const statementQuery = (requestedQuery || "").trim().toLowerCase() || undefined;
-      const fetchLimit = statementQuery ? 20 : statementLimit;
+      const fetchLimit = options?.summaryMode === "count" ? 50 : statementQuery ? 20 : statementLimit;
       const result = await (miniStatementTool as any).execute({ phone, pin, limit: fetchLimit });
       const safeStatementError =
         typeof result?.error === "string" && result.error.trim().length > 0
@@ -742,7 +1071,13 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: "mini_statement",
             step: "awaiting_new_pin",
-            data: { intent: "mini_statement", statementLimit, statementQuery },
+            data: {
+              intent: "mini_statement",
+              statementLimit,
+              statementQuery,
+              summaryMode: options?.summaryMode || "none",
+              summaryFocus: options?.summaryFocus,
+            },
             started_at: new Date().toISOString(),
           });
           return {
@@ -759,15 +1094,46 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: "mini_statement",
             step: "awaiting_pin",
-            data: { intent: "mini_statement", statementLimit, statementQuery },
+            data: {
+              intent: "mini_statement",
+              statementLimit,
+              statementQuery,
+              summaryMode: options?.summaryMode || "none",
+              summaryFocus: options?.summaryFocus,
+            },
             started_at: new Date().toISOString(),
           });
+          return {
+            handled: true,
+            reply: "🔐 Please enter your 4-digit transaction PIN to view your mini statement.",
+          };
         }
         return { handled: true, reply: safeStatementError };
       }
       await clearPendingFlow(phone).catch(() => {});
 
       const transactions = Array.isArray(result.transactions) ? result.transactions : [];
+      if (options?.summaryMode === "count") {
+        const focus = options.summaryFocus || "transfer";
+        const countMatches = transactions.filter((txn: any) => {
+          const haystack = `${txn?.description || ""} ${txn?.type || ""} ${txn?.reference || ""}`.toLowerCase();
+          if (focus === "all") return true;
+          if (focus === "transfer") return haystack.includes("transfer");
+          if (focus === "bill_payment") return haystack.includes("bill");
+          if (focus === "debit") return haystack.includes("debit");
+          if (focus === "credit") return haystack.includes("credit");
+          return true;
+        });
+
+        agentState = await stateManager.completeGoal(agentState);
+        return {
+          handled: true,
+          reply: focus === "transfer"
+            ? `You have made ${countMatches.length} transfer transaction(s) in your recent history.`
+            : `You have made ${countMatches.length} matching transaction(s) in your recent history.`,
+        };
+      }
+
       const matchedTransactions = statementQuery
         ? transactions.filter((txn: any) => {
             const haystack = `${txn?.description || ""} ${txn?.type || ""} ${txn?.reference || ""}`.toLowerCase();
@@ -796,14 +1162,16 @@ const executeConversationFlowStep = createStep({
           timeZone: "Africa/Lagos",
         });
         const direction = String(txn.type || "").toLowerCase().includes("debit") ? "🔴 Debit" : "🟢 Credit";
-        const description = txn.description || txn.type || "Transaction";
-        return `• ${dateText}\n  ${direction} — ${description}\n  Amount: ${money(Number(txn.amount || 0))}\n  Ref: ${txn.reference || "N/A"}`;
+        const description = maskSensitiveNumericTokens(String(txn.description || txn.type || "Transaction"));
+        const safeRef = maskSensitiveNumericTokens(String(txn.reference || "N/A"));
+        return `• ${dateText}\n  ${direction} — ${description}\n  Amount: ${money(Number(txn.amount || 0))}\n  Ref: ${safeRef}`;
       });
       return {
         handled: true,
-        reply:
+        reply: maskSensitiveNumericTokens(
           `${statementQuery ? `Transactions matching "${statementQuery}"` : `Last ${txns.length} transactions`} — A/C: ${result.maskedAccount || "N/A"}\n` +
-          `${lines.join("\n\n")}`,
+          `${lines.join("\n\n")}`
+        ),
       };
     };
 
@@ -889,7 +1257,11 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: flowAction,
             step: "awaiting_new_pin",
-            data: { ...(pending?.data || {}), successNextStep },
+            data: buildPinSetupData({
+              postPinIntent: flowAction,
+              postPinStep: successNextStep,
+              existingData: { ...(pending?.data || {}), successNextStep },
+            }),
             started_at: pending?.started_at || new Date().toISOString(),
           });
           return {
@@ -1036,7 +1408,11 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: pending.action,
             step: "awaiting_new_pin",
-            data: { intent: pending.data.intent },
+            data: buildPinSetupData({
+              postPinIntent: pending.action,
+              postPinStep: "awaiting_pin",
+              existingData: { intent: pending.data.intent },
+            }),
             started_at: pending.started_at,
           });
           return { handled: true, reply: "PINs don't match. Please enter a new 4-digit PIN." };
@@ -1052,13 +1428,21 @@ const executeConversationFlowStep = createStep({
         await clearPendingFlow(phone).catch(() => {});
         
         // Now proceed with the original transaction
-        return pending.action === "balance"
+        const resumed = pending.action === "balance"
           ? await runBalance(pin)
           : await runStatement(
               pin,
               Number((pending.data as any)?.statementLimit ?? 10),
-              String((pending.data as any)?.statementQuery || "")
+              String((pending.data as any)?.statementQuery || ""),
+              {
+                summaryMode: (pending.data as any)?.summaryMode as any,
+                summaryFocus: (pending.data as any)?.summaryFocus as any,
+              }
             );
+        return {
+          handled: true,
+          reply: prependPinCreatedMessage(resumed.reply),
+        };
       }
 
       if (step === "awaiting_pin") {
@@ -1109,7 +1493,11 @@ const executeConversationFlowStep = createStep({
           : await runStatement(
               pin,
               Number((pending.data as any)?.statementLimit ?? 10),
-              String((pending.data as any)?.statementQuery || "")
+              String((pending.data as any)?.statementQuery || ""),
+              {
+                summaryMode: (pending.data as any)?.summaryMode as any,
+                summaryFocus: (pending.data as any)?.summaryFocus as any,
+              }
             );
       }
     }
@@ -1123,6 +1511,32 @@ const executeConversationFlowStep = createStep({
         if (intentData.cancel) {
           await clearPendingFlow(phone).catch(() => {});
           return { handled: true, reply: "Transfer cancelled." };
+        }
+
+        const pinCheck = await (checkHasPinTool as any).execute({ phone });
+        if (!pinCheck?.found) {
+          await clearPendingFlow(phone).catch(() => {});
+          return {
+            handled: true,
+            reply: "Your number is not registered with First Bank Nigeria. Please visit any branch or dial *894# to link your account.",
+          };
+        }
+
+        if (!pinCheck?.hasPin) {
+          await setPendingFlow(phone, {
+            action: "transfer",
+            step: "awaiting_new_pin",
+            data: buildPinSetupData({
+              postPinIntent: "transfer",
+              postPinStep: "awaiting_transfer_details",
+              existingData: data,
+            }),
+            started_at: pending.started_at,
+          });
+          return {
+            handled: true,
+            reply: "🔐 You haven't set up a transaction PIN yet. Please create a 4-digit PIN now.",
+          };
         }
 
         const resolvedAmount = Number(data.amount || 0) || intentData.amount || asAmount(message) || undefined;
@@ -1246,8 +1660,8 @@ const executeConversationFlowStep = createStep({
           return remindActiveFlow({
             pendingAction: pending.action,
             currentStep: step,
-            nextInstruction: "Please enter a new 4-digit transaction PIN.",
-            fallback: "Please enter a new 4-digit transaction PIN.",
+            nextInstruction: "🔐 You haven't set up a transaction PIN yet. Please create a 4-digit PIN now.",
+            fallback: "🔐 You haven't set up a transaction PIN yet. Please create a 4-digit PIN now.",
           });
         }
         
@@ -1287,7 +1701,11 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: "transfer",
             step: "awaiting_new_pin",
-            data: { successNextStep: data.successNextStep },
+            data: buildPinSetupData({
+              postPinIntent: "transfer",
+              postPinStep: String(data.successNextStep || "awaiting_transfer_final_confirmation"),
+              existingData: { successNextStep: data.successNextStep },
+            }),
             started_at: pending.started_at,
           });
           return { handled: true, reply: "PINs don't match. Please enter a new 4-digit PIN." };
@@ -1299,8 +1717,52 @@ const executeConversationFlowStep = createStep({
           return { handled: true, reply: createPin?.message || "PIN setup failed. Please try again." };
         }
 
-        // PIN created - proceed with verifyPinThenOtp for OTP
-        return verifyPinThenOtp("transfer", data.successNextStep || "awaiting_transfer_final_confirmation", pin);
+        const resumeStep = String(data.post_pin_step || data.successNextStep || "awaiting_transfer_final_confirmation");
+        if (resumeStep === "awaiting_transfer_details") {
+          const resumedAmount = Number(data.amount || 0) || undefined;
+          const resumedRecipient = (data.recipientAccount as string | undefined) || undefined;
+          const resumedNarration = (data.narration as string | undefined) || undefined;
+
+          if (!resumedAmount || !resumedRecipient) {
+            await setPendingFlow(phone, {
+              action: "transfer",
+              step: "awaiting_transfer_details",
+              data: {
+                amount: resumedAmount,
+                recipientAccount: resumedRecipient,
+                narration: resumedNarration,
+                post_pin_intent: "transfer",
+                pending_pin_creation: false,
+              },
+              started_at: pending.started_at,
+            });
+
+            return {
+              handled: true,
+              reply: prependPinCreatedMessage(
+                buildTransferDetailsFollowUp({
+                  amount: resumedAmount,
+                  recipientAccount: resumedRecipient,
+                  narration: resumedNarration,
+                })
+              ),
+            };
+          }
+
+          const resumed = await beginTransferConfirmation({
+            amount: Number(resumedAmount),
+            recipientAccount: String(resumedRecipient),
+            narration: resumedNarration,
+            startedAt: pending.started_at,
+          });
+          return {
+            handled: true,
+            reply: prependPinCreatedMessage(resumed.reply),
+          };
+        }
+
+        // PIN created inside an in-progress transfer authorization step.
+        return verifyPinThenOtp("transfer", resumeStep, pin);
       }
 
       if (step === "awaiting_pin") {
@@ -1400,6 +1862,7 @@ const executeConversationFlowStep = createStep({
 
         const receipt = await (generateReceiptTool as any).execute({ reference: transfer.reference });
         await clearPendingFlow(phone).catch(() => {});
+        agentState = await stateManager.completeGoal(agentState);
         return {
           handled: true,
           reply: receipt?.success
@@ -1553,8 +2016,8 @@ const executeConversationFlowStep = createStep({
           return remindActiveFlow({
             pendingAction: pending.action,
             currentStep: step,
-            nextInstruction: "Please enter a new 4-digit transaction PIN.",
-            fallback: "Please enter a new 4-digit transaction PIN.",
+            nextInstruction: "🔐 You haven't set up a transaction PIN yet. Please create a 4-digit PIN now.",
+            fallback: "🔐 You haven't set up a transaction PIN yet. Please create a 4-digit PIN now.",
           });
         }
         
@@ -1594,7 +2057,11 @@ const executeConversationFlowStep = createStep({
           await setPendingFlow(phone, {
             action: "bill_payment",
             step: "awaiting_new_pin",
-            data: { successNextStep: data.successNextStep },
+            data: buildPinSetupData({
+              postPinIntent: "bill_payment",
+              postPinStep: String(data.successNextStep || "awaiting_bill_final_confirmation"),
+              existingData: { successNextStep: data.successNextStep },
+            }),
             started_at: pending.started_at,
           });
           return { handled: true, reply: "PINs don't match. Please enter a new 4-digit PIN." };
@@ -1698,6 +2165,7 @@ const executeConversationFlowStep = createStep({
           amount: Number(data.amount),
         });
         await clearPendingFlow(phone).catch(() => {});
+        agentState = await stateManager.completeGoal(agentState);
         return {
           handled: true,
           reply: payment?.success
@@ -1720,14 +2188,49 @@ const executeConversationFlowStep = createStep({
       return await runStatement(
         asFourDigits(intentData.pin) ?? undefined,
         asTxnLimit(message) ?? 10,
-        asStatementSearchTerm(message) ?? undefined
+        asStatementSearchTerm(message) ?? undefined,
+        {
+          summaryMode: intentData.summaryMode,
+          summaryFocus: intentData.summaryFocus,
+        }
       );
     }
 
     if (action === "transfer") {
+      const hasPin = await (checkHasPinTool as any).execute({ phone });
+      if (!hasPin?.found) {
+        return {
+          handled: true,
+          reply: "Your number is not registered with First Bank Nigeria. Please visit any branch or dial *894# to link your account.",
+        };
+      }
+
       const amount = intentData.amount || asAmount(message) || undefined;
       const recipientAccount = intentData.recipientAccount || asAccountNumber(message) || undefined;
       const narration = asNarration(message) || intentData.narration || undefined;
+
+      if (!hasPin?.hasPin) {
+        await setPendingFlow(phone, {
+          action: "transfer",
+          step: "awaiting_new_pin",
+          data: buildPinSetupData({
+            postPinIntent: "transfer",
+            postPinStep: "awaiting_transfer_details",
+            originalData: {
+              amount,
+              recipientAccount,
+              narration,
+            },
+          }),
+          started_at: new Date().toISOString(),
+        });
+
+        return {
+          handled: true,
+          reply: "🔐 You haven't set up a transaction PIN yet. Please create a 4-digit PIN now.",
+        };
+      }
+
       if (!amount || !recipientAccount) {
         await setPendingFlow(phone, {
           action: "transfer",
@@ -1755,7 +2258,7 @@ const executeConversationFlowStep = createStep({
 
     if (action === "bill_payment") {
       const amount = intentData.amount || asAmount(message) || undefined;
-      const billerName = intentData.billerName || undefined;
+      const billerName = intentData.billerName || asBillerName(message) || undefined;
       const billReference = intentData.billReference || asBillReference(message) || undefined;
       if (!amount || !billerName || !billReference) {
         const missingItems: string[] = [];

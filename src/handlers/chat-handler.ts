@@ -1,37 +1,31 @@
 import { mastra } from "../mastra/index.js";
 import { TRANSACTION_UNKNOWN_REPLY, transactionWorkflow } from "../mastra/workflows/transaction-workflow.js";
-import { INSIGHTS_UNKNOWN_REPLY, insightsWorkflow } from "../mastra/workflows/insights-workflow.js";
 import { sendAgentReply } from "../utils/send-agent-reply.js";
 import { markAsRead, sendWhatsAppTyping } from "../whatsapp-client.js";
 import { formatPhoneNumber, maskPhone } from "../utils/format-phone.js";
-import { clearPendingFlow, getSessionState, touchSession, buildResumptionHint } from "../utils/session-state.js";
+import { getSessionState, touchSession, buildResumptionHint } from "../utils/session-state.js";
+import { stateManager } from "../core/index.js";
+
+// ─────────────────────────────────────────────────────────────────────────
+// NEW SERVICES FOR PRODUCTION
+// ─────────────────────────────────────────────────────────────────────────
+import {
+  buildSystemPrompt,
+  buildUserContextPrompt,
+  buildResumptionMessage,
+} from "../services/conversation-context.js";
+
+import {
+  getAuthorizationStatus,
+  isPinExpired,
+  isOtpExpired,
+} from "../services/authorization-service.js";
+import { analyzePersonalMemoryTurn, renderProfileMemoryReply } from "../services/personal-memory.js";
+import { runWithRequestContext } from "../utils/request-context.js";
 
 const TYPING_INTERVAL_MS = 8_000;
 // How long of a gap (ms) qualifies a customer as "returning" for resumption hints
 const RESUME_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
-
-const MAIN_MENU_REPLY =
-  `👋 Welcome to *FirstBank* WhatsApp Banking!\n\n` +
-  `I'm FirstBot. Here's what I can help you with today:\n\n` +
-  `[1] *Account & Transactions* — balance, transfers, bill payments\n` +
-  `[2] *Onboarding & KYC* — open account, verify identity, activate channel\n` +
-  `[3] *Security* — fraud alerts, block card, manage devices\n` +
-  `[4] *Financial Insights* — spending analysis, budget, credit score\n` +
-  `[5] *Support & Help* — FAQs, complaints, speak to an agent\n\n` +
-  `Just type what you need, or reply with a number.\n` +
-  `<options>[{"id":"1","title":"Account & Transactions"},{"id":"2","title":"Onboarding & KYC"},{"id":"3","title":"Security"},{"id":"4","title":"Financial Insights"},{"id":"5","title":"Support & Help"}]</options>`;
-
-function isGreetingOnlyMessage(input: string): boolean {
-  const text = input.trim().toLowerCase();
-  if (!text) return false;
-
-  // Greeting-only path: show menu when there is no explicit banking task.
-  const greetingOnlyPattern = /^(hi+|hello+|hey+|yo+|sup+|howdy|good\s+(morning|afternoon|evening)|start|menu|help|what\s+can\s+you\s+do)[!.?,\s]*$/i;
-  if (!greetingOnlyPattern.test(text)) return false;
-
-  const explicitBankingIntent = /\b(balance|transfer|send\s+money|statement|mini\s*statement|bill|airtime|data|kyc|bvn|nin|fraud|card|loan|budget|spending|support|complaint|ticket)\b/i;
-  return !explicitBankingIntent.test(text);
-}
 
 interface WhatsAppMessage {
   from: string;
@@ -84,6 +78,10 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
     return;
   }
 
+  let state = await stateManager.getOrCreateState(phone);
+  state = await stateManager.processMessage(state, userText);
+  const extractedContext = stateManager.extractContext(state);
+
   console.log(`[ChatHandler] Incoming from ${maskPhone(phone)}: "${userText.slice(0, 80)}"`);
 
   // ── Session resumption detection ─────────────────────────────────────────
@@ -94,7 +92,15 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
   try {
     const session = await getSessionState(phone);
     if (session) {
-      resumptionSystemMsg = buildResumptionHint(session, RESUME_THRESHOLD_MS);
+      const rawHint = buildResumptionHint(session, RESUME_THRESHOLD_MS);
+      if (rawHint) {
+        // Use richer buildResumptionMessage when state has customer context
+        const pendingAction = session?.pending_flow?.action as string | undefined;
+        const minutesAway = session?.last_active
+          ? Math.round((Date.now() - new Date(session.last_active).getTime()) / 60000)
+          : undefined;
+        resumptionSystemMsg = buildResumptionMessage(state, pendingAction, minutesAway);
+      }
     }
     // Fire-and-forget — update last_active so next message can detect the gap correctly
     touchSession(phone).catch(() => {});
@@ -115,75 +121,48 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
   }, TYPING_INTERVAL_MS);
 
   try {
-    if (/^end$/i.test(userText.trim())) {
-      await clearPendingFlow(phone).catch(() => {});
+    const sendAndTrack = async (reply: string) => {
+      await sendAgentReply(rawPhone, reply);
+      state = await stateManager.recordResponse(state, reply);
+      await stateManager.saveState(state);
+    };
+
+    const personalMemoryTurn = await analyzePersonalMemoryTurn(userText).catch(() => ({ intent: "none" as const }));
+    if (personalMemoryTurn.intent === "save_profile") {
+      const known = (state.persistent.knowledge || {}) as Record<string, unknown>;
+      const mergedName = String(personalMemoryTurn.name || known.preferred_name || "").trim() || undefined;
+      const mergedLocation = String(personalMemoryTurn.location || known.location || "").trim() || undefined;
+      state.persistent.knowledge = {
+        ...known,
+        preferred_name: mergedName,
+        location: mergedLocation,
+      };
+      await stateManager.saveState(state);
     }
 
-    const session = await getSessionState(phone).catch(() => null);
-    const pendingAction = session?.pending_flow?.action;
-    const hasPendingTransactionFlow = ["balance", "mini_statement", "transfer", "bill_payment"].includes(
-      String(pendingAction || "")
-    );
-
-    if (!pendingAction && isGreetingOnlyMessage(userText)) {
-      await sendAgentReply(rawPhone, MAIN_MENU_REPLY);
-      console.log(`[ChatHandler] Greeting-only opener detected for ${maskPhone(phone)}; sent deterministic main menu.`);
+    if (personalMemoryTurn.intent === "recall_profile") {
+      const known = (state.persistent.knowledge || {}) as Record<string, unknown>;
+      const name = String(known.preferred_name || "").trim();
+      const location = String(known.location || "").trim();
+      await sendAndTrack(renderProfileMemoryReply({ name, location }));
       return;
     }
 
-    if (hasPendingTransactionFlow) {
+    const wf = await runWithRequestContext({ phone }, async () => {
       const run = await transactionWorkflow.createRun();
-      const wf = await run.start({
-        inputData: {
-          phone,
-          action: pendingAction as any,
-          message: userText,
-        },
-      });
-
-      if (wf.status === "success" && wf.result.handled) {
-        await sendAgentReply(rawPhone, wf.result.reply);
-        const workflowReplyPreview = typeof wf.result.reply === "string" ? wf.result.reply : JSON.stringify(wf.result.reply);
-        console.log(`[ChatHandler] Workflow reply sent to ${maskPhone(phone)}: "${workflowReplyPreview.slice(0, 80)}\n..."`);
-        return;
-      }
-    }
-
-    // Run transaction workflow first for fresh requests as well.
-    // If it returns the unknown sentinel, continue with supervisor for general conversation.
-    {
-      const run = await transactionWorkflow.createRun();
-      const wf = await run.start({
+      return await run.start({
         inputData: {
           phone,
           message: userText,
         },
       });
+    });
 
-      if (wf.status === "success" && wf.result.handled && wf.result.reply !== TRANSACTION_UNKNOWN_REPLY) {
-        await sendAgentReply(rawPhone, wf.result.reply);
-        const workflowReplyPreview = typeof wf.result.reply === "string" ? wf.result.reply : JSON.stringify(wf.result.reply);
-        console.log(`[ChatHandler] Workflow reply sent to ${maskPhone(phone)}: "${workflowReplyPreview.slice(0, 80)}\n..."`);
-        return;
-      }
-    }
-
-    // Run insights workflow before supervisor fallback to keep analytics/chart behavior deterministic.
-    {
-      const run = await insightsWorkflow.createRun();
-      const wf = await run.start({
-        inputData: {
-          phone,
-          message: userText,
-        },
-      });
-
-      if (wf.status === "success" && wf.result.handled && wf.result.reply !== INSIGHTS_UNKNOWN_REPLY) {
-        await sendAgentReply(rawPhone, wf.result.reply);
-        const workflowReplyPreview = typeof wf.result.reply === "string" ? wf.result.reply : JSON.stringify(wf.result.reply);
-        console.log(`[ChatHandler] Insights workflow reply sent to ${maskPhone(phone)}: "${workflowReplyPreview.slice(0, 80)}\n..."`);
-        return;
-      }
+    if (wf.status === "success" && wf.result.handled && wf.result.reply !== TRANSACTION_UNKNOWN_REPLY) {
+      await sendAndTrack(wf.result.reply);
+      const workflowReplyPreview = typeof wf.result.reply === "string" ? wf.result.reply : JSON.stringify(wf.result.reply);
+      console.log(`[ChatHandler] Workflow reply sent to ${maskPhone(phone)}: "${workflowReplyPreview.slice(0, 80)}\n..."`);
+      return;
     }
 
     const supervisor = mastra.getAgent("bankingSupervisor");
@@ -199,6 +178,26 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
     // Always inject phone so transaction/insights tools can auto-lookup accounts without
     // asking the customer for their account number.
     messages.push({ role: "system", content: `Customer phone: ${phone}. Use this phone number when calling account-lookup or balance tools — never ask the customer to provide their account number.` });
+    // Use auth-aware system prompt from conversation-context service
+    messages.push({ role: "system", content: buildSystemPrompt(state) });
+    // Inject conversation context from the context service
+    const userCtx = buildUserContextPrompt(state);
+    if (userCtx?.trim()) {
+      messages.push({ role: "system", content: `Conversation context:\n${userCtx}` });
+    } else if (extractedContext.userContext?.trim()) {
+      messages.push({ role: "system", content: `Conversation context:\n${extractedContext.userContext}` });
+    }
+    // Add authorization status for the supervisor
+    const authStatus = getAuthorizationStatus(state);
+    if (authStatus.pinStatus !== "pending" || authStatus.otpStatus !== "pending") {
+      messages.push({
+        role: "system",
+        content: `Authorization status — PIN: ${authStatus.pinStatus}${authStatus.pinStatus === "verified" ? ` (${authStatus.pinRemainingSeconds}s remaining)` : ""}. OTP: ${authStatus.otpStatus}${authStatus.otpStatus === "verified" ? ` (${authStatus.otpRemainingSeconds}s remaining)` : ""}.`,
+      });
+    }
+    if (extractedContext.relevantTools.length) {
+      messages.push({ role: "system", content: `Relevant tools for current context: ${extractedContext.relevantTools.join(", ")}.` });
+    }
     if (resumptionSystemMsg) {
       messages.push({ role: "system", content: resumptionSystemMsg });
       console.log(`[ChatHandler] Injecting resumption hint for ${maskPhone(phone)}: state="${resumptionSystemMsg.slice(0, 80)}..."`);
@@ -212,28 +211,34 @@ export async function handleIncomingMessage(message: WhatsAppMessage): Promise<v
     // Sub-agents use callBankingTool() (direct HTTP to MCP server) independently.
     // Injecting toolsets here caused the supervisor to call raw MCP tools directly
     // (e.g. get_customer_accounts with customer_id=null), bypassing the proper tool chain.
-    const response = await supervisor.generate(
-      messages,
-      {
-        memory: {
-          thread: threadId,
-          resource: phone,
-        },
-      }
+    const response = await runWithRequestContext({ phone }, async () =>
+      supervisor.generate(
+        messages,
+        {
+          memory: {
+            thread: threadId,
+            resource: phone,
+          },
+        }
+      )
     );
 
     const replyText = response.text || "Sorry, I was unable to process your request. Please try again.";
 
-    await sendAgentReply(rawPhone, replyText);
+    await sendAndTrack(replyText);
 
     console.log(`[ChatHandler] Reply sent to ${maskPhone(phone)}: "${replyText.slice(0, 80)}\n..."`);
   } catch (error) {
     console.error(`[ChatHandler] Error processing message for ${maskPhone(phone)}:`, error);
+    const fallbackReply =
+      `⚠️ Something went wrong on our end. Please try again in a moment.\n\n` +
+      `If the issue persists, call our support line: ${process.env.SUPPORT_PHONE}`;
     await sendAgentReply(
       rawPhone,
-      `⚠️ Something went wrong on our end. Please try again in a moment.\n\n` +
-        `If the issue persists, call our support line: ${process.env.SUPPORT_PHONE}`
+      fallbackReply
     ).catch(() => {});
+    state = await stateManager.recordResponse(state, fallbackReply);
+    await stateManager.saveState(state).catch(() => {});
   } finally {
     typingActive = false;
     clearInterval(typingTimer);

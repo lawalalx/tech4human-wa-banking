@@ -35,7 +35,7 @@ Usage:
 """
 from __future__ import annotations
 
-import sys, asyncio, json, uuid, time, re
+import sys, asyncio, json, uuid, time, re, os
 from datetime import datetime
 from typing import Optional
 
@@ -47,7 +47,7 @@ from mcp.client.sse import sse_client
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-NODE_BASE   = "http://localhost:3000"
+NODE_BASE   = os.environ.get("NODE_BASE", "http://localhost:3002")
 MCP_BASE    = "http://127.0.0.1:3001"
 CHAT_URL    = f"{NODE_BASE}/api/agent/chat"
 HEALTH_URL  = f"{NODE_BASE}/health"
@@ -163,8 +163,13 @@ def assert_no_full_account(reply: str, label: str) -> None:
 # ─── Unique test phone (to avoid memory bleed between runs) ───────────────────
 _run_id = uuid.uuid4().hex[:6]
 def uphone(tag: str) -> str:
-    """Return a unique fake phone per test run so memory threads don't clash."""
-    return f"test-{_run_id}-{tag}"
+    """Return a unique E.164-like test phone per run/tag within DB phone length limits."""
+    seed = f"{_run_id}:{tag}"
+    n = 0
+    for ch in seed:
+        n = (n * 31 + ord(ch)) % 10_000_000
+    # +23490 + 7 digits => 13 chars total, safe for varchar(20)
+    return f"+23490{n:07d}"
 
 # ─── Wait between turns to avoid rate-limit bursts ───────────────────────────
 INTER_TURN = 3   # seconds between turns within a flow
@@ -183,10 +188,19 @@ def clear_thread(phone: str) -> int:
         conn = psycopg2.connect(PG_URL)
         conn.autocommit = True
         cur = conn.cursor()
+        phone_compact = phone.replace("+", "")
         # Delete messages first (foreign key from messages → threads)
         cur.execute("DELETE FROM mastra_messages WHERE thread_id LIKE %s", (f"{prefix}%",))
         cur.execute("DELETE FROM mastra_threads WHERE id LIKE %s", (f"{prefix}%",))
         deleted = cur.rowcount
+        # Remove legacy session rows completely for both exact and compact phone variants.
+        cur.execute(
+            """
+            DELETE FROM customer_sessions
+            WHERE phone = ANY(%s)
+            """,
+            ([phone, phone_compact],)
+        )
         conn.close()
         return deleted
     except Exception as e:
@@ -744,6 +758,7 @@ def s7_bill_payment():
 # ══════════════════════════════════════════════════════════════════════════════
 def s8_edge_cases():
     section(8, "Edge Cases")
+    clear_thread(f"+{UNKNOWN_PHONE}")
 
     # 8.1 Unregistered phone — supervisor shows welcome menu first (correct), then
     # on the balance enquiry the transaction agent says "not registered"
