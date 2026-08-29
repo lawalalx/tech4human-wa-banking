@@ -122,11 +122,11 @@ export async function saveAgentStateToLegacyDB(state: AgentState): Promise<void>
        (phone, customer_name, account_number, kyc_status, state, authenticated, context, last_active)
        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW())
        ON CONFLICT (phone) DO UPDATE
-       SET customer_name = $2,
-           account_number = $3,
-           kyc_status = $4,
+       SET customer_name = COALESCE(EXCLUDED.customer_name, customer_sessions.customer_name),
+           account_number = COALESCE(EXCLUDED.account_number, customer_sessions.account_number),
+           kyc_status = COALESCE(EXCLUDED.kyc_status, customer_sessions.kyc_status),
            state = $5,
-           authenticated = $6,
+           authenticated = COALESCE(EXCLUDED.authenticated, customer_sessions.authenticated),
            context = $7::jsonb,
            last_active = NOW(),
            updated_at = NOW()`,

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { creditScoreTool, setBudgetTool, spendingInsightsTool } from "../tools/insights-tools.js";
 import { transactionChartTool } from "../tools/chart-tools.js";
 import { resolveCustomerAccountTool } from "../tools/transaction-tools.js";
+import { classifyInsightsIntent } from "../../utils/intent-classifier.js";
 
 const inputSchema = z.object({
   phone: z.string(),
@@ -27,17 +28,6 @@ function parsePeriod(message: string): "this_week" | "last_week" | "this_month" 
   if (text.includes("this week")) return "this_week";
   if (text.includes("last week")) return "last_week";
   return "this_month";
-}
-
-function parseIntent(message: string): InsightsIntent {
-  const text = message.toLowerCase();
-
-  if (/credit\s*score|credit\s*health|credit\s*rating/.test(text)) return "credit_score";
-  if (/set\s*(a\s*)?budget|budget\s*for|budget\s*limit|monthly\s*budget/.test(text)) return "set_budget";
-  if (/chart|graph|visual|trend|line\s*chart|bar\s*chart|pie\s*chart/.test(text)) return "chart";
-  if (/spending|insight|savings|finance\s*analysis|where\s*my\s*money\s*go/.test(text)) return "spending";
-
-  return "unknown";
 }
 
 function parseChartType(message: string): "bar" | "pie" | "line" {
@@ -108,7 +98,7 @@ const executeInsightsStep = createStep({
     }
 
     const period = parsePeriod(message);
-    const intent = parseIntent(message);
+    const intent = await classifyInsightsIntent(message);
 
     if (intent === "credit_score") {
       const result = await (creditScoreTool as any).execute({ phone });

@@ -9,16 +9,17 @@ import {
   listSessionsTool,
   revokeSessionTool,
 
-  sendPhoneVerificationOtpTool,
-  verifyPhoneVerificationOtpTool,
-
   auditLogTool,
 } from "../tools/index.js";
 import { bankingWorkspace } from "../workspace.js";
 import { TokenLimiterProcessor } from "@mastra/core/processors";
 
-const bankName = process.env.BANK_NAME || "First Bank Nigeria";
-const supportPhone = process.env.SUPPORT_PHONE || "+2348001234567";
+import { 
+  botName, 
+  businessName, 
+  supportPhone,
+  supportEmail 
+} from "@/utils/identity.js";
 
 export const securityAgent = new Agent({
   id: "security-agent",
@@ -30,7 +31,7 @@ export const securityAgent = new Agent({
 
   instructions: `
 <role>
-  You are the ${bankName} Account Security Agent.
+  You are the ${businessName} Account Security Agent.
   You protect customers from fraud, manage device sessions, and handle security incidents with urgency and precision.
   Your decisions directly impact customer funds — always err on the side of caution.
 </role>
@@ -104,9 +105,6 @@ export const securityAgent = new Agent({
     resolveFraudAlertTool,
     listSessionsTool,
     revokeSessionTool,
-
-    sendPhoneVerificationOtpTool,
-    verifyPhoneVerificationOtpTool,
     
     auditLogTool,
   },

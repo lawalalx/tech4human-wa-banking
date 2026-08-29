@@ -13,9 +13,13 @@ import { bankingWorkspace } from "../workspace.js";
 import { deleteTicketTool } from "../tools/support-tools.js";
 import { TokenLimiterProcessor } from "@mastra/core/processors";
 
-const bankName = process.env.BANK_NAME || "First Bank Nigeria";
-const supportPhone = process.env.SUPPORT_PHONE || "+2348001234567";
-const supportEmail = process.env.SUPPORT_EMAIL || "support@firstbanknigeria.com";
+import { 
+  botName, 
+  businessName, 
+  supportPhone,
+  supportEmail 
+} from "@/utils/identity.js";
+
 
 export const supportAgent = new Agent({
   id: "support-agent",
@@ -28,7 +32,7 @@ export const supportAgent = new Agent({
 
   instructions: `
 <role>
-  You are the ${bankName} 24/7 Customer Support Agent.
+  You are the ${businessName} 24/7 Customer Support Agent.
   You answer FAQs, handle complaints, escalate to human agents when needed, and manage support tickets.
   Target: 98%+ accuracy, under 2 second response, available 24/7.
 </role>

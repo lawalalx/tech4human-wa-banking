@@ -1,9 +1,32 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { callBankingTool } from "../core/mcp/banking-mcp-client.js";
 import { Pool } from "pg";
+import { getMockStatement } from "../../bank-api/external/register.js";
+import { getAllLinkedAccounts } from "../../utils/session-state.js";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+/** Fetch transactions for a customer's linked accounts via the external MockBank API. */
+async function fetchLinkedTransactions(phone?: string, accountNumber?: string, limit = 50): Promise<any[]> {
+  let accounts: Array<{ accountNumber: string }> = [];
+  if (accountNumber) {
+    accounts = [{ accountNumber }];
+  } else if (phone) {
+    accounts = await getAllLinkedAccounts(phone);
+  }
+  if (!accounts.length) return [];
+
+  const all: any[] = [];
+  for (const acct of accounts) {
+    try {
+      const stmt = await getMockStatement(acct.accountNumber, undefined, 1, limit);
+      all.push(...stmt.transactions.map((t) => ({ ...t, accountNumber: acct.accountNumber })));
+    } catch (err) {
+      console.error(`[insights] statement fetch failed for ${acct.accountNumber}:`, err);
+    }
+  }
+  return all;
+}
 
 // Simple keyword-based category classifier for transaction descriptions
 function classifyTransaction(description: string): string {
@@ -53,22 +76,8 @@ export const spendingInsightsTool = createTool({
   }),
   execute: async ({ phone, accountNumber, period = "this_month" }: { phone?: string; accountNumber?: string; period?: string }) => {
     let resolvedAccount = accountNumber;
-    if (!resolvedAccount) {
-      if (!phone) return { period, totalSpent: 0, totalIncome: 0, netSavings: 0, categories: [], error: "Provide phone or accountNumber" };
-      // Resolve customer account
-      const lookup = await callBankingTool<{ found: boolean; customer_id?: number; message?: string }>(
-        "lookup_customer_by_phone", { phone_number: phone }
-      );
-      if (!lookup.found || !lookup.customer_id) {
-        return { period, totalSpent: 0, totalIncome: 0, netSavings: 0, categories: [], error: lookup.message ?? "Customer not found" };
-      }
-      const acct = await callBankingTool<{ success: boolean; account_number?: string; message?: string }>(
-        "get_customer_account", { customer_id: lookup.customer_id }
-      );
-      if (!acct.success || !acct.account_number) {
-        return { period, totalSpent: 0, totalIncome: 0, netSavings: 0, categories: [], error: acct.message ?? "No account found" };
-      }
-      resolvedAccount = acct.account_number;
+    if (!resolvedAccount && !phone) {
+      return { period, totalSpent: 0, totalIncome: 0, netSavings: 0, categories: [], error: "Provide phone or accountNumber" };
     }
 
     // Determine lookback limit based on period
@@ -77,10 +86,10 @@ export const spendingInsightsTool = createTool({
     };
     const limit = limitMap[period] ?? 50;
 
-    const hist = await callBankingTool<{ success: boolean; transactions?: any[]; message?: string }>(
-      "get_transaction_history", { account_number: resolvedAccount, limit }
-    );
-    const txns: any[] = hist.transactions ?? [];
+    const txns = await fetchLinkedTransactions(phone, resolvedAccount, limit);
+    if (!txns.length) {
+      return { period, totalSpent: 0, totalIncome: 0, netSavings: 0, categories: [], error: "No transactions found for this customer's linked accounts." };
+    }
 
     // Filter by period
     const now = new Date();
@@ -157,27 +166,14 @@ export const creditScoreTool = createTool({
     error: z.string().optional(),
   }),
   execute: async ({ phone }: { phone: string }) => {
-    // Resolve customer
-    const lookup = await callBankingTool<{ found: boolean; customer_id?: number; message?: string }>(
-      "lookup_customer_by_phone", { phone_number: phone }
-    );
-    if (!lookup.found || !lookup.customer_id) {
-      return { found: false, improvementTips: [], error: lookup.message ?? "Customer not found" };
+    const txns = await fetchLinkedTransactions(phone, undefined, 50);
+    if (!txns.length) {
+      return { found: false, improvementTips: [], error: "No transactions found for this customer's linked accounts." };
     }
-    const acct = await callBankingTool<{ success: boolean; account_number?: string; message?: string }>(
-      "get_customer_account", { customer_id: lookup.customer_id }
-    );
-    if (!acct.success || !acct.account_number) {
-      return { found: false, improvementTips: [], error: acct.message ?? "No account found" };
-    }
-    const hist = await callBankingTool<{ success: boolean; transactions?: any[] }>(
-      "get_transaction_history", { account_number: acct.account_number, limit: 50 }
-    );
-    const txns: any[] = hist.transactions ?? [];
 
     // Derive a simple score from transaction pattern
-    const credits = txns.filter((t) => !(t.type ?? "").toLowerCase().includes("debit"));
-    const debits = txns.filter((t) => (t.type ?? "").toLowerCase().includes("debit"));
+    const credits = txns.filter((t) => !String(t.type ?? "").toLowerCase().includes("debit"));
+    const debits = txns.filter((t) => String(t.type ?? "").toLowerCase().includes("debit"));
     const totalCredit = credits.reduce((s: number, t: any) => s + Math.abs(Number(t.amount) || 0), 0);
     const totalDebit = debits.reduce((s: number, t: any) => s + Math.abs(Number(t.amount) || 0), 0);
 

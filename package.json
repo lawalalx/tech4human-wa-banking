@@ -10,7 +10,8 @@
     "start": "node --import=tsx/esm src/index.ts",
     "webhook": "nodemon --config nodemon.json",
     "db:seed": "tsx src/db/seed.ts",
-    "db:migrate": "tsx src/db/migrate.ts"
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:reset": "tsx src/db/reset-db.ts"
   },
   "keywords": [],
   "author": "Tech4Human",
@@ -28,7 +29,6 @@
     "@mastra/fastembed": "^1.0.1",
     "@mastra/libsql": "^1.9.0",
     "@mastra/loggers": "^1.1.1",
-    "@mastra/mcp": "^1.7.0",
     "@mastra/memory": "^1.17.0",
     "@mastra/pg": "^1.9.0",
     "@mastra/rag": "^2.1.2",

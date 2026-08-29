@@ -1,10 +1,11 @@
 import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
+import fs from 'fs';
+import path from 'path';
 import swaggerUi from "swagger-ui-express";
 import { runMigrations } from "./db/migrate.js";
-import { handleIncomingMessage } from "./handlers/chat-handler.js";
+import { handleIncomingMessage, isFlowDonePhrase } from "./handlers/chat-handler.js";
 import { mastra } from "./mastra/index.js";
-import { TRANSACTION_UNKNOWN_REPLY, transactionWorkflow } from "./mastra/workflows/transaction-workflow.js";
 import { sanitizeAgentReply } from "./utils/sanitize-agent-reply.js";
 import { createKbDocsTable } from "./mastra/core/rag/db.js";
 import { initVectorIndex } from "./mastra/core/rag/vector-store.js";
@@ -18,6 +19,43 @@ import {
 } from "./services/conversation-context.js";
 import { analyzePersonalMemoryTurn, renderProfileMemoryReply } from "./services/personal-memory.js";
 import { runWithRequestContext } from "./utils/request-context.js";
+
+import crypto from "crypto";
+import { bankingService } from "./services/banking-service.js";
+import { validateBankAccount, verifyOtp } from "./bank-api/external/register.js";
+import { saveTransactionPin } from "./utils/pin-store.js";
+import {
+  saveFlowResponse,
+  getPhoneByFlowToken,
+  getTokenMap,
+} from "@/meta/meta-services/services.js";
+import {
+  setLinkedAccount,
+  popAwaitingResume,
+  markFlowAutoResumed,
+  setAutoResumeNote,
+  setServiceTermsAccepted,
+} from "./utils/session-state.js";
+import { buildAutoResumeNote } from "./handlers/chat-handler.js";
+
+import { 
+  botName, 
+  businessName, 
+  supportPhone,
+  supportEmail 
+} from "@/utils/identity.js";
+
+import { 
+  createMetaFlow, 
+  uploadFlowJsonBuffer, 
+  publishFlow 
+} from './meta/meta-services/services.js';
+
+import { 
+  buildAccountVerificationFlowJson, 
+  buildSetTransactionPinFlowJson 
+} from './meta/meta-flow-builder';
+
 
 const app = express();
 const args = process.argv;
@@ -37,6 +75,72 @@ const BANK_NAME = process.env.BANK_NAME || "First Bank Nigeria";
 const BOT_NAME = process.env.BOT_NAME || "FBN Banking Assistant";
 const URL = process.env.LOCAL_URL;
 
+/** Mask an account number to "********1234". */
+function maskAccountNumber(account: string): string {
+  return account.length > 4
+    ? `********${account.slice(-4)}`
+    : account;
+}
+
+/**
+ * Flow-completion auto-resumer fallback.
+ *
+ * When a customer completes a Meta Flow (link account / set PIN), Meta sends an
+ * `nfm_reply` interactive webhook that our chat handler uses to auto-resume the
+ * customer's original request — no need for them to type "Done". HOWEVER the
+ * `nfm_reply` can occasionally be delayed or dropped. This fallback is invoked
+ * straight from the flow's data_exchange success callback so that, even if the
+ * nfm_reply never arrives, the pending request still resumes automatically.
+ *
+ * It is idempotent: if the nfm_reply already popped the awaiting-resume marker,
+ * this does nothing. It also records `last_flow_resume_at` so a later nfm_reply
+ * event won't emit a duplicate confirmation.
+ */
+async function autoResumeAfterFlow(phone: string, kind: "link" | "pin"): Promise<void> {
+  if (!phone) return;
+  const resume = await popAwaitingResume(phone).catch(() => null);
+  if (!resume) {
+    console.log(`[autoResume] No awaiting_resume for ${phone} — nfm_reply already handled it or nothing pending.`);
+    return;
+  }
+  if ((resume.kind === "pin" ? "pin" : "link") !== kind) {
+    console.log(`[autoResume] Skipping — stored resume is for ${resume.kind}, this flow was ${kind}.`);
+    return;
+  }
+  if (await isFlowDonePhrase(resume.originalRequest)) {
+    console.log(`[autoResume] Skipping non-actionable resume text: "${resume.originalRequest}".`);
+    return;
+  }
+
+  await markFlowAutoResumed(phone).catch(() => {});
+  // Persist a ready-made step-aware system note; the chat pipeline consumes it
+  // on the very next pass and injects it into the supervisor prompt.
+  await setAutoResumeNote(phone, buildAutoResumeNote(resume.kind, resume.originalRequest)).catch(() => {});
+  console.log(`[autoResume] Resuming ${kind} flow → original request: "${resume.originalRequest}"`);
+
+  // Re-inject the original request through the normal chat pipeline as a plain
+  // text message, so it is handled exactly like the real nfm_reply path.
+  const synthetic = {
+    from: phone,
+    id: `resume-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    type: "text",
+    text: { body: resume.originalRequest },
+    timestamp: String(Date.now()),
+  } as any;
+
+  await handleIncomingMessage(synthetic).catch((err) =>
+    console.error(`[autoResume] Failed to process resumed request:`, err)
+  );
+}
+
+/** Schedule the fallback auto-resume a beat later than the flow's success screen. */
+function scheduleAutoResume(phone: string, kind: "link" | "pin"): void {
+  if (!phone) return;
+  setTimeout(() => {
+    autoResumeAfterFlow(phone, kind).catch(() => {});
+  }, 3500);
+}
+
 app.use(express.json());
 
 
@@ -50,7 +154,7 @@ const swaggerDocument = {
     description:
       "Full API documentation for the Tech4Human WhatsApp Banking Platform.\n\n" +
       "**Key endpoints:**\n" +
-      "- `/webhook` — Meta WhatsApp Cloud API events (POST) + verification (GET)\n" +
+      "- `/webhook/whatsapp` — Meta WhatsApp Cloud API events (POST) + verification (GET)\n" +
       "- `/api/agent/chat` — Direct agent chat for testing without WhatsApp\n" +
       "- `/admin/*` — Operations dashboard endpoints\n\n" +
       "**Architecture:** Supervisor-Agent pattern via Mastra AI. " +
@@ -223,6 +327,100 @@ const swaggerDocument = {
           error: { type: "string" },
         },
       },
+      "CreateBankingFlowRequest": {
+      "type": "object",
+      "required": ["flowType", "name"],
+      "properties": {
+        "flowType": {
+          "type": "string",
+          "enum": ["account_linking", "pin_setup"],
+          "description": "The specific type of banking flow to generate."
+        },
+        "name": {
+          "type": "string",
+          "description": "The name of the Flow in the Meta WhatsApp Manager."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional description of the flow."
+        },
+        "thankYouText": {
+          "type": "string",
+          "description": "Custom text to display on the completion screen."
+        },
+        "banks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "List of banks to display in the dropdown. Required if flowType is 'account_linking'."
+        },
+        "autoPublish": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to attempt to publish the flow immediately after uploading the JSON asset."
+        },
+        "dataEndpointUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "HTTPS webhook URL for Meta to send data exchanges. Defaults to SERVER_URL/webhook/meta-flow-data if omitted."
+          }
+        }
+      },
+      "CreateBankingFlowResponse": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "example": true
+          },
+          "message": {
+            "type": "string",
+            "example": "Successfully generated account_linking. IMPORTANT: Update your .env file with this ID!"
+          },
+          "env_instruction": {
+            "type": "string",
+            "example": "Add this to your .env: ACCOUNT_LINKING_FLOW_ID=123456789012345"
+          },
+          "flowId": {
+            "type": "string",
+            "example": "123456789012345"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["draft", "published", "draft_with_publish_error"],
+            "example": "published"
+          },
+          "dataEndpointUrl": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://your-api.com/webhook/meta-flow-data"
+          },
+          "publishResult": {
+            "type": "object",
+            "description": "The raw response from Meta's publish API (if autoPublish was true).",
+            "additionalProperties": true
+          }
+        }
+      },
+      "MetaFlowDataRequest": {
+        "type": "object",
+        "required": ["encrypted_flow_data", "encrypted_aes_key", "initial_vector"],
+        "properties": {
+          "encrypted_flow_data": {
+            "type": "string",
+            "description": "Base64 encoded encrypted request payload from Meta containing the action (ping, INIT, data_exchange) and flow data."
+          },
+          "encrypted_aes_key": {
+            "type": "string",
+            "description": "Base64 encoded AES key, symmetrically encrypted with your RSA Public Key."
+          },
+          "initial_vector": {
+            "type": "string",
+            "description": "Base64 encoded 128-bit initialization vector used for decryption."
+          }
+        }
+      }
     },
   },
   paths: {
@@ -252,7 +450,7 @@ const swaggerDocument = {
       },
     },
 
-    "/webhook": {
+    "/webhook/whatsapp": {
       get: {
         tags: ["Webhook"],
         summary: "Meta webhook verification",
@@ -705,6 +903,132 @@ const swaggerDocument = {
         },
       },
     },
+
+    "/admin/banking-flows": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Create and publish a WhatsApp Banking Flow",
+        "description": "Generates, uploads, and optionally publishes a Meta WhatsApp Flow JSON for either account linking or PIN setup.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBankingFlowRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Flow created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateBankingFlowResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request - Validation Error (e.g., missing banks for account linking, invalid URL, or missing name)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "example": "flowType must be 'account_linking' or 'pin_setup'"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "example": "Failed to create banking flow"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/webhook/meta-flow-data": {
+      "post": {
+        "tags": ["Webhook"],
+        "summary": "Meta WhatsApp Flow Data Endpoint",
+        "description": "Handles encrypted requests from WhatsApp Flows. Processes `ping` for health checks, `INIT` for initial screen state, and `data_exchange` for verifying bank accounts and OTPs. Returns an encrypted Base64 string.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MetaFlowDataRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful operation. Returns an encrypted Base64 string containing the next screen state or action.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "yZcJQaH3AqfzKgjn64vAcASaJrOMN27S6CESyU68WN/cDCP6abskoMa/pPjszXGKy..."
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request - Missing required encryption parameters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "example": "Missing encryption payload parameters"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error - Missing private key or decryption/processing failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "example": "Server key configuration error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
   },
 };
 
@@ -733,8 +1057,110 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
+
+
+app.post('/admin/banking-flows', async (req: Request, res: Response) => {
+  try {
+    const {
+      flowType, // Must be 'account_linking' or 'pin_setup'
+      name,
+      description,
+      thankYouText,
+      banks,
+      autoPublish = true,
+      dataEndpointUrl,
+    } = req.body || {};
+
+    // 1. Validate Input
+    if (!['account_linking', 'pin_setup'].includes(flowType)) {
+      return res.status(400).json({ 
+        error: "flowType must be 'account_linking' or 'pin_setup'" 
+      });
+    }
+
+    if (!name) {
+      return res.status(400).json({ error: "name is required" });
+    }
+
+    // 2. Validate Endpoint URL (Meta requires this to be a secure HTTPS URL)
+    const serverUrl = (process.env.SERVER_URL || '').replace(/\/$/, '');
+    const endpointUrl = dataEndpointUrl || `${serverUrl}/webhook/meta-flow-data`;
+
+    if (!endpointUrl.startsWith('https://')) {
+      return res.status(400).json({
+        error: 'dataEndpointUrl must be a valid HTTPS URL (Set SERVER_URL in .env)',
+      });
+    }
+
+    // 3. Build the specific Flow JSON
+    let flowJson;
+    
+    if (flowType === 'account_linking') {
+      if (!Array.isArray(banks) || banks.length === 0) {
+        return res.status(400).json({ 
+          error: "banks array is required for 'account_linking' flows" 
+        });
+      }
+      flowJson = buildAccountVerificationFlowJson({
+        name,
+        description,
+        banks,
+        thankYouText
+      });
+    } else {
+      flowJson = buildSetTransactionPinFlowJson();
+    }
+
+    console.log(`\n--- BUILDING FLOW: ${name} ---`);
+    const flowJsonBuffer = Buffer.from(JSON.stringify(flowJson, null, 2));
+
+    // 4. Create Meta Flow (Using UTILITY or OTHER category)
+    const flowId = await createMetaFlow(name, ['OTHER']);
+    console.log(`✅ Flow created on Meta with ID: ${flowId}`);
+
+    // 5. Upload Flow JSON Asset
+    await uploadFlowJsonBuffer(flowId, flowJsonBuffer);
+    console.log(`✅ JSON successfully uploaded for Flow ID: ${flowId}`);
+
+    // 6. Publish Flow (If requested)
+    let publishResult: any = null;
+    let finalStatus = 'draft';
+
+    if (autoPublish) {
+      try {
+        console.log(`🚀 Attempting to publish flow...`);
+        // The publishFlow helper correctly sets the endpoint_uri and waits 5 seconds!
+        publishResult = await publishFlow(flowId);
+        finalStatus = 'published';
+        console.log(`✅ Flow Published Successfully`);
+      } catch (err: any) {
+        console.error('❌ Publish failed. Make sure your webhook is live and responds to "ping".', err.message);
+        finalStatus = 'draft_with_publish_error';
+      }
+    }
+
+    // 7. Return payload for the Developer
+    return res.status(201).json({
+      success: true,
+      message: `Successfully generated ${flowType}. IMPORTANT: Update your .env file with this ID!`,
+      env_instruction: `Add this to your .env: ${flowType.toUpperCase()}_FLOW_ID=${flowId}`,
+      flowId,
+      status: finalStatus,
+      dataEndpointUrl: endpointUrl,
+      publishResult,
+    });
+
+  } catch (e: any) {
+    console.error('POST /admin/banking-flows failed', e);
+    return res.status(500).json({
+      error: e.message || 'Failed to create banking flow',
+    });
+  }
+});
+
+
 // ─── Meta Webhook Verification (GET) ───────────────────────────
-app.get("/webhook", (req: Request, res: Response) => {
+app.get("/webhook/whatsapp", (req: Request, res: Response) => {
   const mode = req.query["hub.mode"] as string;
   const token = req.query["hub.verify_token"] as string;
   const challenge = req.query["hub.challenge"] as string;
@@ -749,7 +1175,7 @@ app.get("/webhook", (req: Request, res: Response) => {
 });
 
 // ─── Incoming WhatsApp Messages (POST) ─────────────────────────
-app.post("/webhook", async (req: Request, res: Response) => {
+app.post("/webhook/whatsapp", async (req: Request, res: Response) => {
   const body = req.body;
 
   // Always respond 200 immediately to prevent Meta retries
@@ -835,6 +1261,29 @@ app.get("/admin/tickets", async (_req: Request, res: Response) => {
   }
 });
 
+// ─── Dev/Test: Clear session state for a phone number ────────────
+// Use in automated E2E tests to reset pending flow + conversation history between sections.
+// NEVER expose this in production (guard by NODE_ENV).
+if (process.env.NODE_ENV !== "production") {
+  app.delete("/admin/clear-session/:phone", async (req: Request, res: Response) => {
+    try {
+      const { Pool } = await import("pg");
+      const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+      const phone = (req.params.phone || "").replace(/\D/g, "");
+      if (!phone) {
+        await pool.end();
+        return res.status(400).json({ error: "phone is required" });
+      }
+      await pool.query("DELETE FROM pending_flows WHERE phone = $1", [phone]);
+      await pool.query("DELETE FROM conversation_history WHERE phone = $1", [phone]);
+      await pool.end();
+      res.json({ cleared: true, phone });
+    } catch (err) {
+      res.status(500).json({ error: "Failed to clear session" });
+    }
+  });
+}
+
 // ─── Dev/Test: Direct Agent Chat ────────────────────────────────
 // Test any banking flow without needing a real WhatsApp number.
 // Conversations are fully persisted — use the same `phone` to test multi-turn memory.
@@ -884,19 +1333,6 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
       return await respond(renderProfileMemoryReply({ name, location }));
     }
 
-    const wf = await runWithRequestContext({ phone: phoneNorm }, async () => {
-      const run = await transactionWorkflow.createRun();
-      return await run.start({
-        inputData: {
-          phone: phoneNorm,
-          message: message.trim(),
-        },
-      });
-    });
-
-    if (wf.status === "success" && wf.result.handled && wf.result.reply !== TRANSACTION_UNKNOWN_REPLY) {
-      return await respond(wf.result.reply);
-    }
 
     const supervisor = mastra.getAgent("bankingSupervisor");
 
@@ -907,7 +1343,7 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
       content: `Customer phone: ${phoneNorm}. Use this phone number when calling account-lookup or balance tools — never ask the customer to provide their account number.`,
     });
     messages.push({ role: "system", content: extractedContext.systemPrompt });
-    messages.push({ role: "system", content: buildSystemPrompt(state, BANK_NAME, BOT_NAME) });
+    messages.push({ role: "system", content: buildSystemPrompt(state) });
     const userCtx = buildUserContextPrompt(state);
     if (userCtx?.trim()) {
       messages.push({ role: "system", content: `Conversation context:\n${userCtx}` });
@@ -950,6 +1386,376 @@ app.post("/api/agent/chat", async (req: Request, res: Response) => {
   }
 });
 
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// META FLOW DATA WEBHOOK
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/webhook/meta-flow-data', async (req: Request, res: Response) => {
+
+  try {
+    const { encrypted_flow_data, encrypted_aes_key, initial_vector } = req.body || {};
+
+    if (!encrypted_flow_data || !encrypted_aes_key || !initial_vector) {
+      console.error('❌ Missing encryption payload parameters');
+      return res.status(400).json({ error: 'Missing encryption payload parameters' });
+    }
+
+    // ── 1. LOAD & CLEAN PRIVATE KEY ─────────────────────────────────────────
+    let privateKeyRaw = process.env.WHATSAPP_PRIVATE_KEY;
+
+    // Fallback: Read directly from file if env variable is missing or invalid
+    if (!privateKeyRaw || !privateKeyRaw.includes('BEGIN RSA PRIVATE KEY')) {
+      const keyPath = path.join(process.cwd(), 'private.pem');
+      if (fs.existsSync(keyPath)) {
+        privateKeyRaw = fs.readFileSync(keyPath, 'utf8');
+      }
+    }
+
+    if (!privateKeyRaw) {
+      console.error('❌ Private key not found in process.env or private.pem');
+      return res.status(500).json({ error: 'Server key configuration error' });
+    }
+
+    const privateKey = privateKeyRaw.replace(/\\n/g, '\n').trim();
+
+    // ── 2. DECRYPT AES KEY ──────────────────────────────────────────────────
+    const aesKey = crypto.privateDecrypt(
+      {
+        key: privateKey,
+        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+        oaepHash: 'sha256',
+      },
+      Buffer.from(encrypted_aes_key, 'base64')
+    );
+
+    // ── 3. DECRYPT FLOW PAYLOAD ─────────────────────────────────────────────
+    const iv = Buffer.from(initial_vector, 'base64');
+    const encryptedBuffer = Buffer.from(encrypted_flow_data, 'base64');
+    const tag = encryptedBuffer.subarray(encryptedBuffer.length - 16);
+    const ciphertext = encryptedBuffer.subarray(0, encryptedBuffer.length - 16);
+
+    const decipher = crypto.createDecipheriv('aes-128-gcm', aesKey, iv);
+    decipher.setAuthTag(tag);
+    let decrypted = decipher.update(ciphertext, undefined, 'utf8');
+    decrypted += decipher.final('utf8');
+
+    const payload = JSON.parse(decrypted);
+    console.log('✅ Decrypted Meta Payload:', JSON.stringify(payload));
+
+    // ── 4. ENCRYPT RESPONSE HELPER ──────────────────────────────────────────
+    const flippedIv = Buffer.from(iv.map((byte) => byte ^ 0xff));
+    const encryptResponse = (responsePayload: Record<string, any>): string => {
+      const cipher = crypto.createCipheriv('aes-128-gcm', aesKey, flippedIv);
+      let encryptedRes = cipher.update(JSON.stringify(responsePayload), 'utf8');
+      encryptedRes = Buffer.concat([encryptedRes, cipher.final()]);
+      return Buffer.concat([encryptedRes, cipher.getAuthTag()]).toString('base64');
+    };
+
+    const flowVersion = payload.version || '3.0';
+
+    // ── 5. HANDLE PING ──────────────────────────────────────────────────────
+    if (payload.action === 'ping') {
+      console.log('🟢 Responding to Meta Health Check (ping)');
+      const response = encryptResponse({ version: flowVersion, data: { status: 'active' } });
+      return res.status(200).type('text/plain').send(response);
+    }
+
+    // ── 6. HANDLE INIT & BACK ──────────────────────────────────────────────
+    if (payload.action === 'INIT' || payload.action === 'BACK') {
+      // Detect whether this INIT belongs to the SET-PIN flow (which starts on
+      // PIN_SETUP_SCREEN) vs the LINK-ACCOUNT flow (starts on ACCOUNT_FORM).
+      let isPinInit = false;
+      try {
+        const initToken = String(payload.flow_token || '');
+        const initFlowId = String(payload.flow_id || '');
+        const setPinNoId = (process.env.SET_PIN_FLOW_ID || process.env.SET_PIN_FLOW || '').trim();
+        if (initFlowId && setPinNoId && initFlowId === setPinNoId) isPinInit = true;
+        else if (initToken) {
+          const initMap = await getTokenMap(initToken).catch(() => null);
+          if (initMap) {
+            if (initMap.survey_id === 'set-pin') isPinInit = true;
+            else if (setPinNoId && String(initMap.flow_id || '') === setPinNoId) isPinInit = true;
+          }
+        }
+      } catch {
+        /* default to link flow screen */
+      }
+
+      return res.status(200).type('text/plain').send(
+        encryptResponse({
+          version: flowVersion,
+          screen: isPinInit ? 'PIN_SETUP_SCREEN' : 'ACCOUNT_FORM',
+          data: isPinInit
+            ? { show_error: false, error_message: '' }
+            : {
+                show_otp: false,
+                show_account_error: false,
+                account_error: '',
+                otpReference: ''
+              },
+        })
+      );
+    }
+
+    // ── 7. HANDLE DATA EXCHANGE ACTIONS ─────────────────────────────────────
+    if (payload.action === 'data_exchange') {
+      const payloadData = payload.data || {};
+      const actionType = payloadData.action_type || payload.action_type;
+
+      const firstname = String(payloadData.firstname || '').trim();
+      const lastname = String(payloadData.lastname || '').trim();
+      const account = String(payloadData.account || '').trim();
+      const bankCode = String(payloadData.bank || '').trim();
+      const otp = String(payloadData.otp || '').trim();
+      const otpReference = String(payloadData.otpReference || '').trim();
+
+      // SUB-ACTION A: VERIFY ACCOUNT NUMBER
+      if (actionType === 'verify_account') {
+        const bankResponse = await validateBankAccount(account, bankCode);
+
+        if (!bankResponse.success || !bankResponse.data) {
+          return res.status(200).type('text/plain').send(
+            encryptResponse({
+              version: flowVersion,
+              screen: 'ACCOUNT_FORM',
+              data: {
+                show_otp: false,
+                show_account_error: true,
+                account_error: '❌ Invalid account details. Please verify and try again.',
+                otpReference: ''
+              },
+            })
+          );
+        }
+
+        return res.status(200).type('text/plain').send(
+          encryptResponse({
+            version: flowVersion,
+            screen: 'ACCOUNT_FORM',
+            data: {
+              show_otp: true,
+              show_account_error: false,
+              account_error: '',
+              otpReference: bankResponse.data.otpReference 
+            },
+          })
+        );
+      }
+
+      // SUB-ACTION B: VERIFY OTP & SUBMIT FORM
+      if (actionType === 'submit_form') {
+        const otpResponse = await verifyOtp(account, otp, otpReference);
+        
+        const userToken = otpResponse?.data?.userToken;
+
+        if (!otpResponse || !otpResponse.success || !userToken) {
+          return res.status(200).type('text/plain').send(
+            encryptResponse({
+              version: flowVersion,
+              screen: 'ACCOUNT_FORM',
+              data: {
+                show_otp: true,
+                show_account_error: true,
+                account_error: '❌ Incorrect OTP code. Please try again.',
+                otpReference
+              },
+            })
+          );
+        }
+
+        // Save Customer Details
+        const storage = mastra.getStorage() as any;
+        const flowToken = String(payload.flow_token || payloadData.flow_token || '');
+        const flowId = String(payload.flow_id || payloadData.flow_id || '');
+
+        // ── Resolve the customer phone FIRST so every persistence step below
+        // (verified_customers + customer_sessions) is keyed to the same phone.
+        const flowPhone = await getPhoneByFlowToken(flowToken).catch((err) => {
+          console.error(`⚠️ Error fetching phone for token ${flowToken}:`, err);
+          return null;
+        });
+        console.log(`\n🔍 [DEBUG-LINKING] Resolved flowToken: ${flowToken} to flowPhone: ${flowPhone}`);
+
+        if (storage?.db) {
+          try {
+            await bankingService.saveVerifiedCustomer(storage.db, {
+              flowId,
+              flowToken,
+              accountDetails: { firstname, lastname, account, bankCode },
+              bankToken: userToken,
+              phoneNumber: flowPhone ?? undefined,
+            });
+          } catch (dbErr) {
+            console.error('⚠️ DB Save Failed:', dbErr);
+          }
+        }
+
+        try {
+          await saveFlowResponse({
+            flowId,
+            flowToken,
+            customerPhone: flowPhone || undefined,
+            surveyId: 'link-account',
+            responses: {
+              firstname,
+              lastname,
+              account,
+              bank: bankCode,
+              otpVerified: true,
+              userToken: userToken,
+            },
+          }).catch((err) => console.error('⚠️ Flow response save failed:', err));
+
+          if (flowPhone) {
+            console.log(`\n\n🔗 [DEBUG-LINKING] Calling setLinkedAccount for phone: ${flowPhone}`);
+                        await setLinkedAccount(flowPhone, {
+              accountNumber: account,
+              maskedAccount: maskAccountNumber(account),
+              accountType: 'current',
+            }).catch((err) => {
+              console.error(`❌ [DEBUG-LINKING] setLinkedAccount completely failed:`, err);
+            });
+            // The customer has just verified account + OTP + bank token via the
+            // secure Link-Account flow — they are fully onboarded. Auto-accept the
+            // service T&C so the bankingSupervisor's PHASE-1 onboarding gate
+            // (isUserAcceptedTermsAndConditionTool) returns accepted=true and the
+            // request is delegated to the balance/transfer sub-agent instead of
+            // re-emitting the link-account CTA on every message.
+            await setServiceTermsAccepted(flowPhone).catch((err) => {
+              console.error(`⚠️ [DEBUG-LINKING] setServiceTermsAccepted failed:`, err);
+            });
+            console.log(`✅ [DEBUG-LINKING] setLinkedAccount + T&C accepted for phone: ${flowPhone}`);
+            // Auto-resume the customer's original request without waiting for
+            // them to type "Done" — this is the nfm_reply-independent fallback.
+            scheduleAutoResume(flowPhone, "link");
+          } else {
+            console.warn(`⚠️ [DEBUG-LINKING] Skipping setLinkedAccount because flowPhone is null. Did you save the token before sending the flow?`);
+          }
+        } catch (err) {
+          console.error('⚠️ Flow response persistence error:', err);
+        }
+
+        return res.status(200).type('text/plain').send(
+          encryptResponse({
+            version: flowVersion,
+            screen: 'COMPLETE',
+            data: {},
+          })
+        );
+      }
+
+      // SUB-ACTION C: SET TRANSACTION PIN (from the PIN-setup Meta Flow)
+      // COMPLETE without ever saving the PIN, so every later balance/transfer
+      // attempt kept answering pinCreationRequired=true (the "link loop").
+      if (actionType === 'submit_pin') {
+        const pin = String(payloadData.pin ?? '').trim();
+        const confirmPin = String(payloadData.confirm_pin ?? '').trim();
+
+        const pinFlowToken = String(payload.flow_token || payloadData.flow_token || '');
+        const pinFlowId = String(payload.flow_id || payloadData.flow_id || '');
+
+        // Basic validation — return the error screen so the customer can retry
+        if (!/^\d{4}$/.test(pin)) {
+          return res.status(200).type('text/plain').send(
+            encryptResponse({
+              version: flowVersion,
+              screen: 'PIN_SETUP_SCREEN',
+              data: {
+                show_error: true,
+                error_message: '❌ PIN must be exactly 4 digits. Please try again.',
+              },
+            })
+          );
+        }
+        if (pin !== confirmPin) {
+          return res.status(200).type('text/plain').send(
+            encryptResponse({
+              version: flowVersion,
+              screen: 'PIN_SETUP_SCREEN',
+              data: {
+                show_error: true,
+                error_message: '❌ PINs do not match. Please try again.',
+              },
+            })
+          );
+        }
+
+        const pinFlowPhone = await getPhoneByFlowToken(pinFlowToken).catch((err) => {
+          console.error(`⚠️ [submit_pin] Error fetching phone for token ${pinFlowToken}:`, err);
+          return null;
+        });
+        console.log(`🔑 [DEBUG-PIN] submit_pin resolved flowToken to phone: ${pinFlowPhone}`);
+
+        if (!pinFlowPhone) {
+          console.error('❌ [submit_pin] Cannot save PIN — flow token is not mapped to a customer phone.');
+          return res.status(200).type('text/plain').send(
+            encryptResponse({
+              version: flowVersion,
+              screen: 'PIN_SETUP_SCREEN',
+              data: {
+                show_error: true,
+                error_message: '⚠️ We could not identify your number. Please restart the chat and try again.',
+              },
+            })
+          );
+        }
+
+        const savedPin = await saveTransactionPin(pinFlowPhone, pin);
+        if (!savedPin) {
+          console.error('❌ [submit_pin] saveTransactionPin failed for phone:', pinFlowPhone);
+          return res.status(200).type('text/plain').send(
+            encryptResponse({
+              version: flowVersion,
+              screen: 'PIN_SETUP_SCREEN',
+              data: {
+                show_error: true,
+                error_message: '⚠️ We could not save your PIN right now. Please try again.',
+              },
+            })
+          );
+        }
+
+        // Persist a completion record — NEVER store the PIN itself.
+        await saveFlowResponse({
+          flowId: pinFlowId,
+          flowToken: pinFlowToken,
+          customerPhone: pinFlowPhone,
+          surveyId: 'set-pin',
+          responses: { pinSet: true },
+        }).catch((err) => console.error('⚠️ [submit_pin] Flow response save failed:', err));
+
+        console.log(`✅ [submit_pin] Transaction PIN saved for phone: ${pinFlowPhone}`);
+        // Auto-resume the original request (no "Done" needed) — nfm_reply fallback.
+        scheduleAutoResume(pinFlowPhone, "pin");
+        return res.status(200).type('text/plain').send(
+          encryptResponse({
+            version: flowVersion,
+            screen: 'COMPLETE',
+            data: {},
+          })
+        );
+      }
+    }
+
+    // Default Fallback
+    return res.status(200).type('text/plain').send(
+      encryptResponse({ version: flowVersion, screen: 'COMPLETE', data: {} })
+    );
+
+  } catch (err: any) {
+    console.error('❌ META FLOW WEBHOOK ERROR:', err);
+
+    if (err.message?.includes('decrypt') || err.message?.includes('auth tag')) {
+      return res.status(421).json({ error: 'Decryption failed' });
+    }
+
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
 // ─── 404 Handler ────────────────────────────────────────────────
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ error: "Route not found" });
@@ -988,6 +1794,8 @@ async function main() {
   });
 
 
+
+
   // if (process.env.NODE_ENV !== "production") {
   //   warmUpEmbeddingModel().catch(console.error);
   // }
@@ -997,7 +1805,7 @@ async function main() {
     const orgId = process.env.BANK_ID || "default";
     console.log(`\n🏦 Tech4Human WhatsApp Banking Server`);
     console.log(`📡 Listening on http://localhost:${PORT}`);
-    console.log(`📬 Webhook:     http://localhost:${PORT}/webhook`);
+    console.log(`📬 Webhook:     http://localhost:${PORT}/webhook/whatsapp`);
     console.log(`📖 API Docs:    http://localhost:${PORT}/docs`);
     console.log(`💬 Test Chat:   http://localhost:${PORT}/api/agent/chat`);
     console.log(`📚 KB Upload:   http://localhost:${PORT}/api/kb/upload`);

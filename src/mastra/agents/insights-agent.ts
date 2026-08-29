@@ -8,8 +8,13 @@ import {
 } from "../tools/index.js";
 import { bankingWorkspace } from "../workspace.js";
 import { TokenLimiterProcessor } from "@mastra/core/processors";
+import { 
+  botName, 
+  businessName, 
+  supportPhone,
+  supportEmail 
+} from "@/utils/identity.js";
 
-const bankName = process.env.BANK_NAME || "First Bank Nigeria";
 
 export const insightsAgent = new Agent({
   id: "insights-agent",
@@ -21,9 +26,9 @@ export const insightsAgent = new Agent({
 
   instructions: `
 <role>
-  You are the ${bankName} Personal Finance Intelligence Agent.
+  You are the ${businessName} Personal Finance Intelligence Agent.
   You help customers understand their finances, optimise spending, save smarter, and improve their credit health.
-  All insights are derived ONLY from the customer's own transaction history with ${bankName}.
+  All insights are derived ONLY from the customer's own transaction history with ${businessName}.
 </role>
 
 <workflow_first>
@@ -117,7 +122,7 @@ export const insightsAgent = new Agent({
 </capabilities>
 
 <privacy_reminder>
-  Always include: "These insights are based solely on your transaction history with ${bankName} 
+  Always include: "These insights are based solely on your transaction history with ${businessName} 
   and are for your personal guidance only."
 </privacy_reminder>
 `,

@@ -5,9 +5,10 @@ export {
   verifyAccountNameTool,
   intraTransferTool,
   interBankTransferTool,
+  transferStatusTool,
   billPaymentTool,
   validateBillerTool,
-  lookupCustomerByAccountTool,
+  airtimePurchaseTool,
   lookupCustomerByPhoneTool,
   generateReceiptTool,
 } from "./transaction-tools.js";
@@ -28,22 +29,20 @@ export {
 export { createEscalationTicketTool, queryTicketStatusTool } from "./support-tools.js";
 export { spendingInsightsTool, creditScoreTool, setBudgetTool } from "./insights-tools.js";
 export { auditLogTool, updateNotificationPrefsTool } from "./audit-tools.js";
-export { 
-  lookupCustomerForOnboardingTool, 
-  checkOnboardingStatusTool, 
-  acceptTermsAndConditionsTool, 
-  sendPhoneVerificationOtpTool, 
-  verifyPhoneVerificationOtpTool, 
-  markPhoneVerifiedTool,
-} from "./onboarding-tools.js";
 
-export { 
-  checkHasPinTool, 
-  createTransactionPinTool, 
-  verifyTransactionPinTool 
+
+export {
+  acceptTermsAndConditionsTool,
+  addNewAccountTool,
+} from "./tnc-account-tools.js";
+
+export {
+  checkHasPinTool,
+  verifyTransactionPinTool,
+  setTransactionPinTool,
+  createTransactionPinTool,
 } from "./pin-tools.js";
 
 export { transactionChartTool } from "./chart-tools.js";
 export { knowledgeBaseTool } from "./knowledge-base-tool.js";
-export { runTransactionWorkflowTool } from "./transaction-workflow-tool.js";
 export { runInsightsWorkflowTool } from "./insights-workflow-tool.js";

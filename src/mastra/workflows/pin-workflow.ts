@@ -18,7 +18,7 @@
  */
 import { createWorkflow, createStep } from "@mastra/core/workflows";
 import { z } from "zod";
-import { callBankingTool } from "../core/mcp/banking-mcp-client.js";
+import { lookupCustomerByPhone } from "../../services/local-customer-service.js";
 import { sendWhatsAppText } from "../../whatsapp-client.js";
 
 // ─── Step 1: Lookup customer & check PIN status ───────────────────────────────
@@ -40,13 +40,7 @@ const checkPinExistsStep = createStep({
   execute: async ({ inputData }) => {
     const { phone } = inputData;
 
-    const result = await callBankingTool<{
-      found: boolean;
-      customer_id?: number;
-      has_pin?: boolean;
-      is_validated?: boolean;
-      message?: string;
-    }>("lookup_customer_by_phone", { phone_number: phone });
+    const result = await lookupCustomerByPhone(phone);
 
     return {
       phone,

@@ -1,13 +1,32 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { callBankingTool } from "../core/mcp/banking-mcp-client.js";
 import { randomUUID } from "crypto";
+import {
+  getMockBankBalance,
+  getMockStatement,
+  executeMockTransfer,
+  payMockBill,
+  getTransferStatus,
+  validateBankAccount,
+  purchaseMockAirtime,
+} from "../../bank-api/external/register.js";
+import {
+  getAllLinkedAccounts,
+  getLinkedAccount,
+} from "../../utils/session-state.js";
+import {
+  hasTransactionPin,
+  verifyStoredPin,
+} from "../../utils/pin-store.js";
+
+// NIBSS code of the bank this platform debits from (the customer's linked accounts)
+const SOURCE_BANK_CODE = process.env.SOURCE_BANK_CODE || "011";
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 interface AccountSummary {
-  account_number: string;
-  account_number_masked: string;
-  account_type: string;
+  accountNumber: string;
+  maskedAccount: string;
+  accountType: string;
 }
 
 // ─── resolve-customer-account ─────────────────────────────────────────────────
@@ -35,82 +54,35 @@ export const lookupCustomerByPhoneTool = createTool({
     customerId: z.number().optional(),
     hasPin: z.boolean().optional(),
     message: z.string().optional(),
+    linkAdvice: z.string().optional(),
   }),
   execute: async ({ phone }: { phone: string }) => {
-    const result = await callBankingTool<{
-      found: boolean;
-      customer_id?: number;
-      has_pin?: boolean;
-      message?: string;
-    }>("lookup_customer_by_phone", { phone_number: phone });
+    const accounts = await getAllLinkedAccounts(phone).catch(() => [] as Array<{ accountNumber: string }>);
+    const hasPin = await hasTransactionPin(phone);
+
+    if (!accounts.length) {
+      return {
+        found: false,
+        hasPin,
+       message:
+          "No bank account is linked to this WhatsApp number yet. " +
+          "If the customer just said 'Done' or claims they linked it, tell them: " +
+          "'I'm sorry, but I still can't see a linked account on my end. Please ensure you completed the flow, or type Menu to go back.' " +
+          "Otherwise, call add-new-account to send the secure Link Account Flow.",
+      linkAdvice:
+          "Tap 'Link Bank Account' and complete the secure flow to add your bank account to WhatsApp.",
+      
+      };
+    }
 
     return {
-      found: result.found ?? false,
-      customerId: result.customer_id,
-      hasPin: result.has_pin ?? false,
-      message: result.found ? undefined : result.message,
+      found: true,
+      hasPin,
+      message: `${accounts.length} linked account(s) found on this number.`,
     };
   },
 });
 
-
-// async def lookup_customer_by_account(account_number: str, bank_code: str) -> LookupCustomerByAccountResponse:
-// Look up customer destils by accountnumber and bank_code
-export const lookupCustomerByAccountTool = createTool({
-  id: "lookup-customer-by-account",
-  description:
-    "Look up RECIPIENT/DESTINATION account details by account number. " +
-    "ONLY use this to verify a transfer recipient — NOT for the sender/customer. " +
-    "NEVER pass a phone number to this tool — it requires an actual bank account number. " +
-    "IMPORTANT: This tool ONLY takes account_number parameter (no bank_code). " +
-    "Bank name is automatically resolved from the account lookup response. " +
-    "Returns whether the account exists, the associated account name, bank name, and customer ID. " +
-    "This tool is used to verify recipient details before executing interbank transfers.",
-  inputSchema: z.object({
-    accountNumber: z.string().describe("The destination account number to look up"),
-  }),
-  outputSchema: z.object({
-    found: z.boolean(),
-    accountName: z.string().optional(),
-    customerId: z.number().optional(),
-    message: z.string().optional(),
-    bankName: z.string().optional(),
-    bankOptions: z.array(z.string()).optional(),
-  }),
-  execute: async ({ accountNumber }: { accountNumber: string }) => {
-    // FIXED: Only pass account_number, NOT bank_code
-    // Bank name is returned directly from MCP response
-    const result = await callBankingTool<{
-      found: boolean;
-      customer_name?: string;
-      customer_id?: number;
-      message?: string;
-      bank_name?: string;
-      bank_options?: string[];
-      possible_banks?: string[];
-      banks?: string[];
-    }>("lookup_customer_by_account", { 
-      account_number: accountNumber 
-    });
-
-    const bankOptions = Array.isArray(result.bank_options)
-      ? result.bank_options
-      : Array.isArray(result.possible_banks)
-      ? result.possible_banks
-      : Array.isArray(result.banks)
-      ? result.banks
-      : undefined;
-
-    return {
-      found: result.found ?? false,
-      accountName: result.customer_name ?? undefined,
-      customerId: result.customer_id,
-      message: result.found ? undefined : result.message,
-      bankName: result.bank_name ?? undefined,
-      bankOptions,
-    };
-  },
-});
 
 
 // )async def generate_receipt(reference: str) -> ReceiptResponse:
@@ -130,16 +102,41 @@ export const generateReceiptTool = createTool({
     message: z.string(),
   }),
   execute: async ({ reference }: { reference: string }) => {
-    const result = await callBankingTool<{
-      success: boolean;
-      receipt_text: string;
-      message: string;
-    }>("generate_receipt", { reference });
+    const status = await getTransferStatus(reference);
+
+    if (!status.success || !status.data) {
+      return {
+        success: false,
+        receiptText: "",
+        message: status.message || `No transaction found for reference ${reference}.`,
+      };
+    }
+
+    const fmtNaira = (n?: number) =>
+      typeof n === "number"
+        ? `NGN ${n.toLocaleString("en-NG", { minimumFractionDigits: 2 })}`
+        : "—";
+    const lines = [
+      "🧾 *Transaction Receipt*",
+      "──────────────────────",
+      `Reference: ${status.rubyReference || reference}`,
+      ...(status.bankReference ? [`Bank Ref: ${status.bankReference}`] : []),
+      `Amount: ${fmtNaira(status.amount)}`,
+      `Status: ${(status.status || "unknown").toUpperCase()}`,
+      ...(status.sourceAccount ? [`From: ${status.sourceAccount} (${SOURCE_BANK_CODE})`] : []),
+      ...(status.recipientAccount
+        ? [`To: ${status.recipientAccount}${status.counterpartyBank ? ` — ${status.counterpartyBank}` : ""}`]
+        : []),
+      ...(status.narration ? [`Narration: ${status.narration}`] : []),
+      ...(status.timestamp ? [`Date: ${new Date(status.timestamp).toLocaleString("en-NG")}`] : []),
+      "──────────────────────",
+      "Thank you for banking with us.",
+    ];
 
     return {
-      success: result.success,
-      receiptText: result.receipt_text,
-      message: result.message,
+      success: true,
+      receiptText: lines.join("\n"),
+      message: "Receipt generated.",
     };
   },
 });
@@ -159,11 +156,9 @@ export const resolveCustomerAccountTool = createTool({
   }),
   outputSchema: z.object({
     status: z.enum(["resolved", "multiple_accounts", "not_found"]),
-    // resolved: single account ready to use
     accountNumber: z.string().optional(),
     accountType: z.string().optional(),
     customerId: z.number().optional(),
-    // multiple_accounts: list to present to customer
     accounts: z
       .array(
         z.object({
@@ -173,66 +168,162 @@ export const resolveCustomerAccountTool = createTool({
         })
       )
       .optional(),
-    // not_found: message for the agent
     message: z.string().optional(),
-    // advice to show when phone is not registered
     linkAdvice: z.string().optional(),
   }),
   execute: async ({ phone }: { phone: string }) => {
-    const lookup = await callBankingTool<{
-      found: boolean;
-      customer_id?: number;
-      message?: string;
-    }>("lookup_customer_by_phone", { phone_number: phone });
-
-    if (!lookup.found || !lookup.customer_id) {
+    const accounts = await getAllLinkedAccounts(phone).catch(() => []);
+    
+    if (!accounts.length) {
       return {
         status: "not_found" as const,
-        message: "This phone number is not registered with First Bank Nigeria.",
+        // 👇 UPDATE 1: Better AI instructions when no account is found 👇
+        message:
+          "No bank account is linked to this WhatsApp number yet. " +
+          "Call 'add-new-account' to send the secure Link Account Flow. " +
+          "IMPORTANT: Tell the customer 'Please tap the button below to link your account. Once completed, please type 'Check Balance' or 'Done' so I can verify.' " +
+          "If the user already typed 'Done' and you are seeing this message, tell them: 'I still can't see the linked account. Please make sure you submitted the form, or type Menu to restart.'",
         linkAdvice:
-          "Please visit any First Bank branch or use *894# to link your WhatsApp number to your account so future transactions are seamless.",
+            "Tap 'Link Bank Account' and complete the secure flow to add your bank account to WhatsApp.",
       };
     }
 
-    // Fetch ALL accounts for this customer
-    const accts = await callBankingTool<{
-      success: boolean;
-      accounts?: AccountSummary[];
-      count?: number;
-      message?: string;
-    }>("get_customer_accounts", { customer_id: lookup.customer_id });
-
-    if (!accts.success || !accts.accounts || accts.accounts.length === 0) {
-      return {
-        status: "not_found" as const,
-        message: accts.message ?? "No accounts found for this customer.",
-      };
-    }
-
-    if (accts.accounts.length === 1) {
+    if (accounts.length === 1) {
       return {
         status: "resolved" as const,
-        accountNumber: accts.accounts[0].account_number,
-        accountType: accts.accounts[0].account_type,
-        customerId: lookup.customer_id,
+        accountNumber: accounts[0].accountNumber,
+        accountType: accounts[0].accountType,
       };
     }
 
-    // Multiple accounts — surface all to agent
     return {
       status: "multiple_accounts" as const,
-      customerId: lookup.customer_id,
-      accounts: accts.accounts.map((a) => ({
-        accountNumber: a.account_number,
-        maskedAccount: a.account_number_masked,
-        accountType: a.account_type,
+      accounts: accounts.map((a) => ({
+        accountNumber: a.accountNumber,
+        maskedAccount: a.maskedAccount,
+        accountType: a.accountType,
       })),
-      message: `I can see you have ${accts.accounts.length} accounts on this number.`,
+      message: `You have ${accounts.length} accounts linked to this number.`,
     };
   },
 });
 
-// ─── Balance Enquiry ──────────────────────────────────────────────────────────
+// ─── Shared PIN + account gate ────────────────────────────────────────────────
+// Every transaction tool funnels through here: resolve the linked account and
+// verify the customer's 4-digit PIN BEFORE touching the external bank API.
+
+type GateOk = { ok: true; accountNumber: string };
+
+interface GateFailResult {
+  found: boolean;
+  error: string;
+  pinRequired?: boolean;
+  pinCreationRequired?: boolean;
+  pinVerified?: boolean;
+  attemptsRemaining?: number;
+}
+
+type GateFail = { ok: false; result: GateFailResult };
+
+
+
+async function pinAndAccountGate(
+  phone: string | undefined,
+  accountNumber: string | undefined,
+  pin: string | undefined
+): Promise<GateOk | GateFail> {
+  const sessionAccount = phone ? await getLinkedAccount(phone).catch(() => null) : null;
+  const accounts = phone ? await getAllLinkedAccounts(phone).catch(() => []) : [];
+  
+  let account = accountNumber;
+  if (!account) {
+    const sessionAccNum = sessionAccount?.accountNumber || sessionAccount?.account_number;
+    if (sessionAccNum) {
+      account = sessionAccNum;
+    } else if (accounts.length === 1) {
+      account = accounts[0].accountNumber || accounts[0].account_number;
+    }
+  }
+
+  if (!account) {
+    if (!phone) return { ok: false, result: { found: false, error: "Provide the customer's phone or a pre-selected accountNumber." } };
+    
+    if (accounts.length > 1) {
+      return {
+        ok: false,
+        result: {
+          found: false,
+          error:
+            "MULTIPLE_ACCOUNTS: The customer has more than one linked account. Call resolve-customer-account to present the options and ask which account to use, then retry with that accountNumber.",
+        },
+      };
+    }
+    
+    return {
+      ok: false,
+      result: {
+        found: false,
+        error:
+          "NO_ACCOUNT: No bank account is linked to this WhatsApp number yet. Call add-new-account to send the secure Link Account Flow first. Tell the customer to type 'Done' when finished.",
+      },
+    };
+  }
+
+  // ── ACCOUNT IS FOUND & RESOLVED BEYOND THIS POINT ────────────────────────
+
+  const hasPin = await hasTransactionPin(phone || "").catch(() => false);
+  if (!hasPin) {
+    return {
+      ok: false,
+      result: {
+        found: true,
+        pinCreationRequired: true,
+        error:
+          "🔐 The customer has NO transaction PIN yet. Call set-transaction-pin to send the secure PIN-setup Flow, tell the customer to complete it, then END YOUR TURN. Do NOT ask them to type a PIN in chat. After the flow completes, call this tool again and it will proceed.",
+      },
+    };
+  }
+
+  const trimmedPin = pin?.trim() ?? "";
+  if (!/^\d{4}$/.test(trimmedPin)) {
+    return {
+      ok: false,
+      result: {
+        found: true,
+        pinRequired: true,
+        error: "🔐 Please enter your 4-digit transaction PIN to continue.",
+      },
+    };
+  }
+
+  const verify = await verifyStoredPin(phone || "", trimmedPin);
+  if (verify.blocked) {
+    return {
+      ok: false,
+      result: {
+        found: true,
+        pinVerified: false,
+        attemptsRemaining: 0,
+        error: `🔒 Your account is temporarily locked after too many incorrect PIN attempts.${
+          verify.lockedMinutesRemaining ? ` Try again in ${verify.lockedMinutesRemaining} minute(s).` : ""
+        }`,
+      },
+    };
+  }
+  if (!verify.verified) {
+    return {
+      ok: false,
+      result: {
+        found: true,
+        pinVerified: false,
+        attemptsRemaining: verify.attemptsRemaining ?? 0,
+        error: `❌ Incorrect PIN. ${verify.attemptsRemaining ?? 0} attempt(s) remaining.`,
+      },
+    };
+  }
+
+  return { ok: true, accountNumber: account };
+}
 
 export const balanceEnquiryTool = createTool({
   id: "get-balance",
@@ -241,9 +332,8 @@ export const balanceEnquiryTool = createTool({
     "Pass 'phone' to auto-lookup (single account). " +
     "Pass 'accountNumber' directly when the customer has already chosen one from a multi-account selection. " +
     "If the customer has a PIN set, pass 'pin' extracted from their most recent message. " +
-    "If 'pin' is missing but required, the tool returns pinRequired=true — " +
-    "respond by asking the customer for their 4-digit transaction PIN and call this tool again with pin=<their4Digits>. " +
-    "If PIN is wrong, the tool returns pinVerified=false with attemptsRemaining. " +
+    "If pinCreationRequired=true is returned, respond by asking the customer to enter a new 4-digit transaction PIN, and call this tool again with pin=<their4Digits> once provided. " +
+    "If pinRequired=true is returned, respond by asking the customer for their 4-digit transaction PIN and call this tool again with pin=<their4Digits>. " +
     "DO NOT call verify-transaction-pin separately for balance — this tool handles everything.",
   inputSchema: z.object({
     phone: z.string().optional().describe("Customer's phone — used to auto-lookup their account"),
@@ -263,76 +353,20 @@ export const balanceEnquiryTool = createTool({
     error: z.string().optional(),
   }),
   execute: async ({ phone, accountNumber, pin }: { phone?: string; accountNumber?: string; pin?: string }) => {
-    let resolvedAccount = accountNumber;
-    let customerId: number | undefined;
-    let hasPin = false;
+    const gate = await pinAndAccountGate(phone, accountNumber, pin);
+    if (!gate.ok) return gate.result;
 
-    if (!resolvedAccount) {
-      if (!phone) return { found: false, error: "Provide phone or accountNumber" };
-      const lookup = await callBankingTool<{ found: boolean; customer_id?: number; has_pin?: boolean; message?: string }>(
-        "lookup_customer_by_phone", { phone_number: phone }
-      );
-      if (!lookup.found || !lookup.customer_id) {
-        return {
-          found: false,
-          error: "Your phone number is not registered with First Bank Nigeria. Please visit any First Bank branch or dial *894# to link your WhatsApp number.",
-        };
-      }
-      customerId = lookup.customer_id;
-      hasPin = lookup.has_pin ?? false;
-
-      // MANDATORY PIN GATE — enforce PIN creation/verification BEFORE balance retrieval
-      // PIN is REQUIRED for all transactions
-      if (!hasPin) {
-        // Customer has no PIN yet — must create one first
-        return {
-          found: false,
-          pinCreationRequired: true,
-          error: "🔐 For security, you must create a 4-digit transaction PIN before viewing your balance. This PIN protects your account for all transactions.",
-        };
-      }
-
-      // Customer has PIN — verify it
-      const trimmedPin = pin?.trim() ?? "";
-      if (!trimmedPin || !/^\d{4,6}$/.test(trimmedPin)) {
-        return {
-          found: false,
-          pinRequired: true,
-          error: "🔐 Please enter your 4-digit transaction PIN to view your balance.",
-        };
-      }
-      const pinResult = await callBankingTool<{ is_valid?: boolean; success?: boolean; blocked?: boolean; remaining_attempts?: number; message?: string }>(
-        "verify_pin", { customer_id: customerId, pin: trimmedPin }
-      );
-      if (pinResult.blocked) {
-        return { found: false, pinVerified: false, attemptsRemaining: 0, error: "🔒 Your account is locked due to too many incorrect PIN attempts. Please contact First Bank support." };
-      }
-      const verified = pinResult.is_valid ?? pinResult.success ?? false;
-      if (!verified) {
-        const rem = pinResult.remaining_attempts ?? 0;
-        return { found: false, pinVerified: false, attemptsRemaining: rem, error: `❌ Incorrect PIN. ${rem} attempt(s) remaining. Please try again.` };
-      }
-
-      const acct = await callBankingTool<{ success: boolean; account_number?: string; message?: string }>(
-        "get_customer_account", { customer_id: customerId }
-      );
-      if (!acct.success || !acct.account_number) {
-        return { found: false, error: acct.message ?? "No account found" };
-      }
-      resolvedAccount = acct.account_number;
+    // NOTE: the external MockBank API stores balances in kobo — convert to Naira
+    const bal = await getMockBankBalance(gate.accountNumber);
+    if (!bal.success || bal.balance === undefined) {
+      return { found: false, error: bal.message ?? "Balance is temporarily unavailable. Please try again shortly." };
     }
-
-    const bal = await callBankingTool<{ success: boolean; account_number_masked?: string; balance?: number; currency?: string; account_type?: string; message?: string }>(
-      "get_account_balance", { account_number: resolvedAccount }
-    );
-    if (!bal.success) return { found: false, error: bal.message ?? "Balance unavailable" };
+    const masked = gate.accountNumber.slice(0, 3) + "****" + gate.accountNumber.slice(-4);
     return {
       found: true,
-      pinVerified: hasPin ? true : undefined,
-      maskedAccount: bal.account_number_masked,
+      maskedAccount: masked,
       balance: bal.balance,
       currency: bal.currency ?? "NGN",
-      accountType: bal.account_type,
     };
   },
 });
@@ -375,91 +409,26 @@ export const miniStatementTool = createTool({
     error: z.string().optional(),
   }),
   execute: async ({ phone, accountNumber, limit = 10, pin }: { phone?: string; accountNumber?: string; limit?: number; pin?: string }) => {
-    let resolvedAccount = accountNumber;
-    let customerId: number | undefined;
-    let hasPin = false;
+    const gate = await pinAndAccountGate(phone, accountNumber, pin);
+    if (!gate.ok) return { ...gate.result, transactions: [] };
 
-    if (!resolvedAccount) {
-      if (!phone) return { found: false, error: "Provide phone or accountNumber", transactions: [] };
-      const lookup = await callBankingTool<{ found: boolean; customer_id?: number; has_pin?: boolean; message?: string }>(
-        "lookup_customer_by_phone", { phone_number: phone }
-      );
-      if (!lookup.found || !lookup.customer_id) {
-        return {
-          found: false,
-          error: "Your phone number is not registered with First Bank Nigeria. Please visit any First Bank branch or dial *894# to link your WhatsApp number.",
-          transactions: [],
-        };
-      }
-      customerId = lookup.customer_id;
-      hasPin = lookup.has_pin ?? false;
-
-      // MANDATORY PIN GATE — enforce PIN creation/verification BEFORE statement retrieval
-      // PIN is REQUIRED for all transactions
-      if (!hasPin) {
-        // Customer has no PIN yet — must create one first
-        return {
-          found: false,
-          pinCreationRequired: true,
-          error: "🔐 For security, you must create a 4-digit transaction PIN before viewing your transactions. This PIN protects your account for all transactions.",
-          transactions: [],
-        };
-      }
-
-      // Customer has PIN — verify it
-      const trimmedPin = pin?.trim() ?? "";
-      if (!trimmedPin || !/^\d{4,6}$/.test(trimmedPin)) {
-        return {
-          found: false,
-          pinRequired: true,
-          error: "🔐 Please enter your 4-digit transaction PIN to view your transactions.",
-          transactions: [],
-        };
-      }
-      const pinResult = await callBankingTool<{ is_valid?: boolean; success?: boolean; blocked?: boolean; remaining_attempts?: number; message?: string }>(
-        "verify_pin", { customer_id: customerId, pin: trimmedPin }
-      );
-      if (pinResult.blocked) {
-        return { found: false, pinVerified: false, attemptsRemaining: 0, error: "🔒 Your account is locked due to too many incorrect PIN attempts. Please contact First Bank support.", transactions: [] };
-      }
-      const verified = pinResult.is_valid ?? pinResult.success ?? false;
-      if (!verified) {
-        const rem = pinResult.remaining_attempts ?? 0;
-        return { found: false, pinVerified: false, attemptsRemaining: rem, error: `❌ Incorrect PIN. ${rem} attempt(s) remaining. Please try again.`, transactions: [] };
-      }
-
-      const acct = await callBankingTool<{ success: boolean; account_number?: string; message?: string }>(
-        "get_customer_account", { customer_id: customerId }
-      );
-      if (!acct.success || !acct.account_number) {
-        return { found: false, error: acct.message ?? "No account found", transactions: [] };
-      }
-      resolvedAccount = acct.account_number;
+    const stmt = await getMockStatement(gate.accountNumber, SOURCE_BANK_CODE, 1, Math.min(Math.max(limit, 1), 20));
+    if (!stmt.success) {
+      return { found: false, error: stmt.message ?? "Statement is temporarily unavailable.", transactions: [] };
     }
-
-    const hist = await callBankingTool<{ success: boolean; transactions?: any[]; message?: string }>(
-      "get_transaction_history", { account_number: resolvedAccount, limit }
-    );
-    const an = resolvedAccount;
+    const an = gate.accountNumber;
     const masked = an.slice(0, 3) + "****" + an.slice(-4);
-    const normalizedTransactions = Array.isArray(hist?.transactions)
-      ? hist.transactions.map((txn) => ({
-          date: String(txn?.date ?? new Date().toISOString()),
-          type: String(txn?.type ?? "Transaction"),
-          amount: Number(txn?.amount ?? 0),
-          currency: String(txn?.currency ?? "NGN"),
-          reference: String(txn?.reference ?? "N/A"),
-          description:
-            txn?.description == null
-              ? undefined
-              : String(txn.description),
-        }))
-      : [];
     return {
       found: true,
-      pinVerified: hasPin ? true : undefined,
       maskedAccount: masked,
-      transactions: normalizedTransactions,
+      transactions: stmt.transactions.map((txn) => ({
+        date: txn.date,
+        type: txn.type,
+        amount: txn.amount,
+        currency: txn.currency ?? "NGN",
+        reference: String(txn.reference ?? "N/A"),
+        description: txn.description ?? undefined,
+      })),
     };
   },
 });
@@ -469,24 +438,30 @@ export const miniStatementTool = createTool({
 export const verifyAccountNameTool = createTool({
   id: "verify-account-name",
   description:
-    "Verify the account name for a given account number via MCP lookup. " +
-    "Always call this before any interbank transfer to confirm the destination account owner. " +
-    "For First Bank accounts use bankCode='000016'.",
+    "Verify the recipient's account name before any transfer or bill payment. " +
+    "Calls the external bank API validate-account endpoint which resolves the account name " +
+    "and triggers an OTP dispatch to the phone number registered on that account. " +
+    "Use NIBSS codes e.g. '011' First Bank, '058' GTBank, '044' Access.",
   inputSchema: z.object({
     accountNumber: z.string().describe("Destination account number"),
-    bankCode: z.string().describe("NIBSS bank code (e.g. '000016' for First Bank)"),
+    bankCode: z.string().describe("NIBSS bank code of the destination bank (e.g. '058' for GTBank)"),
   }),
   outputSchema: z.object({
     found: z.boolean(),
     accountName: z.string().optional(),
+    otpReference: z.string().optional(),
     error: z.string().optional(),
   }),
   execute: async ({ accountNumber, bankCode }: { accountNumber: string; bankCode: string }) => {
-    const result = await callBankingTool<{ found: boolean; account_name?: string; message?: string }>(
-      "lookup_customer_by_account", { account_number: accountNumber, bank_code: bankCode }
-    );
-    if (!result.found) return { found: false, error: result.message ?? "Account not found" };
-    return { found: true, accountName: result.account_name };
+    const result = await validateBankAccount(accountNumber, bankCode);
+    if (!result.success || !result.data) {
+      return { found: false, error: result.error ?? result.message ?? "Account could not be validated. Please check the account number and bank." };
+    }
+    return {
+      found: true,
+      accountName: (result.data as any)?.accountName ?? (result.data as any)?.account_name ?? undefined,
+      otpReference: (result.data as any)?.otpReference ?? undefined,
+    };
   },
 });
 
@@ -495,40 +470,70 @@ export const verifyAccountNameTool = createTool({
 export const intraTransferTool = createTool({
   id: "execute-intra-transfer",
   description:
-    "Execute a fund transfer to another account within First Bank. " +
-    "Only call this AFTER OTP has been verified and customer has confirmed the recipient. " +
-    "Returns a transaction reference on success.",
+    "Execute an INTERNAL (same-bank) fund transfer from the customer's linked account. " +
+    "This tool verifies the customer's transaction PIN internally — always pass 'pin'. " +
+    "Only call AFTER the recipient's name has been confirmed. Returns the Ruby reference on success.",
   inputSchema: z.object({
-    fromAccount: z.string().describe("Sender's account number"),
-    toAccount: z.string().describe("Recipient's First Bank account number"),
-    amount: z.number().describe("Amount in NGN"),
-    narration: z.string().describe("Transfer narration / description"),
+    phone: z.string().describe("Customer's WhatsApp phone number from context"),
+    fromAccount: z.string().optional().describe("Debit account number — omit when the customer has a single linked account"),
+    toAccount: z.string().describe("Recipient's internal account number"),
+    amount: z.number().positive().describe("Amount in NGN"),
+    narration: z.string().optional().default("WhatsApp Transfer").describe("Transfer narration / description"),
+    pin: z.string().describe("4-digit PIN from the customer's most recent message"),
   }),
   outputSchema: z.object({
     success: z.boolean(),
     reference: z.string().optional(),
+    status: z.string().optional(),
     message: z.string(),
+    pinRequired: z.boolean().optional(),
+    pinCreationRequired: z.boolean().optional(),
+    pinVerified: z.boolean().optional(),
+    attemptsRemaining: z.number().optional(),
   }),
   execute: async ({
+    phone,
     fromAccount,
     toAccount,
     amount,
     narration,
+    pin,
   }: {
-    fromAccount: string;
+    phone: string;
+    fromAccount?: string;
     toAccount: string;
     amount: number;
-    narration: string;
+    narration?: string;
+    pin: string;
   }) => {
-    const txnId = `TXN-${Date.now()}-${randomUUID().slice(0, 8).toUpperCase()}`;
-    const result = await callBankingTool<{ success: boolean; message?: string; transaction_id?: string; error_code?: string }>(
-      "transfer_funds",
-      { from_acc: fromAccount, to_acc: toAccount, amount, txn_id: txnId, description: narration }
-    );
+    const gate = await pinAndAccountGate(phone, fromAccount, pin);
+    if (!gate.ok) {
+      const r = gate.result as any;
+      return {
+        success: false,
+        message: String(r?.error ?? "Transfer blocked."),
+        pinRequired: r?.pinRequired,
+        pinCreationRequired: r?.pinCreationRequired,
+        pinVerified: r?.pinVerified,
+        attemptsRemaining: r?.attemptsRemaining,
+      };
+    }
+
+    const reference = `RUBY-${Date.now()}-${randomUUID().slice(0, 6).toUpperCase()}`;
+    const result = await executeMockTransfer({
+      reference,
+      sourceAccount: gate.accountNumber,
+      sourceBankCode: SOURCE_BANK_CODE,
+      destinationAccount: toAccount,
+      destinationBankCode: SOURCE_BANK_CODE,
+      amountKobo: Math.round(amount * 100),
+      narration: narration || "WhatsApp Transfer",
+    });
     return {
       success: result.success,
-      reference: result.transaction_id ?? txnId,
-      message: result.message ?? (result.success ? "Transfer successful" : "Transfer failed"),
+      reference: result.reference,
+      status: result.status,
+      message: result.message ?? (result.success ? "Transfer successful." : "Transfer failed."),
     };
   },
 });
@@ -538,43 +543,108 @@ export const intraTransferTool = createTool({
 export const interBankTransferTool = createTool({
   id: "execute-interbank-transfer",
   description:
-    "Execute a fund transfer to an account in another bank. " +
-    "Only call this AFTER OTP has been verified AND the customer has confirmed the recipient name. " +
-    "Use verify-account-name first to confirm the destination.",
+    "Execute an INTERBANK fund transfer from the customer's linked account to another Nigerian bank. " +
+    "This tool verifies the customer's transaction PIN internally — always pass 'pin'. " +
+    "Use verify-account-name first to confirm the destination, then this tool. Returns the Ruby reference.",
   inputSchema: z.object({
-    fromAccount: z.string().describe("Sender's account number"),
+    phone: z.string().describe("Customer's WhatsApp phone number from context"),
+    fromAccount: z.string().optional().describe("Debit account number — omit when the customer has a single linked account"),
     toAccount: z.string().describe("Recipient's account number at the destination bank"),
-    toBankCode: z.string().describe("NIBSS bank code of destination bank"),
-    amount: z.number().describe("Amount in NGN"),
-    narration: z.string().describe("Transfer narration"),
+    toBankCode: z.string().describe("NIBSS bank code of destination bank (e.g. '058' GTBank)"),
+    amount: z.number().positive().describe("Amount in NGN"),
+    narration: z.string().optional().default("WhatsApp Transfer").describe("Transfer narration"),
+    pin: z.string().describe("4-digit PIN from the customer's most recent message"),
   }),
   outputSchema: z.object({
     success: z.boolean(),
     reference: z.string().optional(),
+    status: z.string().optional(),
     message: z.string(),
+    pinRequired: z.boolean().optional(),
+    pinCreationRequired: z.boolean().optional(),
+    pinVerified: z.boolean().optional(),
+    attemptsRemaining: z.number().optional(),
   }),
   execute: async ({
+    phone,
     fromAccount,
     toAccount,
     toBankCode,
     amount,
     narration,
+    pin,
   }: {
-    fromAccount: string;
+    phone: string;
+    fromAccount?: string;
     toAccount: string;
     toBankCode: string;
     amount: number;
-    narration: string;
+    narration?: string;
+    pin: string;
   }) => {
-    const txnId = `IBT-${Date.now()}-${randomUUID().slice(0, 8).toUpperCase()}`;
-    const result = await callBankingTool<{ success: boolean; message?: string; transaction_id?: string; error_code?: string }>(
-      "transfer_funds",
-      { from_acc: fromAccount, to_acc: toAccount, amount, txn_id: txnId, receiver_bank_code: toBankCode, description: narration }
-    );
+    const gate = await pinAndAccountGate(phone, fromAccount, pin);
+    if (!gate.ok) {
+      const r = gate.result as any;
+      return {
+        success: false,
+        message: String(r?.error ?? "Transfer blocked."),
+        pinRequired: r?.pinRequired,
+        pinCreationRequired: r?.pinCreationRequired,
+        pinVerified: r?.pinVerified,
+        attemptsRemaining: r?.attemptsRemaining,
+      };
+    }
+
+    const reference = `RUBY-${Date.now()}-${randomUUID().slice(0, 6).toUpperCase()}`;
+    const result = await executeMockTransfer({
+      reference,
+      sourceAccount: gate.accountNumber,
+      sourceBankCode: SOURCE_BANK_CODE,
+      destinationAccount: toAccount,
+      destinationBankCode: toBankCode,
+      amountKobo: Math.round(amount * 100),
+      narration: narration || "WhatsApp Transfer",
+    });
     return {
       success: result.success,
-      reference: result.transaction_id ?? txnId,
-      message: result.message ?? (result.success ? "Transfer successful" : "Transfer failed"),
+      reference: result.reference,
+      status: result.status,
+      message: result.message ?? (result.success ? "Transfer successful." : "Transfer failed."),
+    };
+  },
+});
+
+// ─── Transfer Status ──────────────────────────────────────────────────────────
+
+export const transferStatusTool = createTool({
+  id: "get-transfer-status",
+  description:
+    "Check the status of a previous transfer by its Ruby reference (e.g. RUBY-...) or bank reference (ACC-...). " +
+    "Returns the current status, amount and recipient details. No PIN required for status lookups.",
+  inputSchema: z.object({
+    reference: z.string().describe("The Ruby or bank reference of the transfer to query"),
+  }),
+  outputSchema: z.object({
+    found: z.boolean(),
+    status: z.string().optional(),
+    rubyReference: z.string().optional(),
+    bankReference: z.string().optional(),
+    amount: z.number().optional(),
+    recipientAccount: z.string().optional(),
+    counterpartyBank: z.string().optional(),
+    error: z.string().optional(),
+  }),
+  execute: async ({ reference }: { reference: string }) => {
+    const result = await getTransferStatus(reference);
+    if (!result.success) return { found: false, error: result.message ?? "Could not find a transaction with that reference." };
+    return {
+      found: true,
+      status: result.status,
+      rubyReference: result.rubyReference,
+      bankReference: result.bankReference,
+      amount: result.amount,
+      recipientAccount: result.recipientAccount,
+      counterpartyBank: result.counterpartyBank,
     };
   },
 });
@@ -584,48 +654,85 @@ export const interBankTransferTool = createTool({
 export const billPaymentTool = createTool({
   id: "execute-bill-payment",
   description:
-    "Execute a bill payment (electricity, DSTV/GoTV, airtime, data, etc.) via MCP. " +
-    "Only call AFTER OTP verification and customer confirmation.",
+    "Execute a bill payment (DSTV/GoTV, electricity, water, waste, airtime etc.) from the customer's linked account. " +
+    "This tool verifies the customer's transaction PIN internally — always pass 'pin'. " +
+    "Validate the biller with validate-biller first. Amount is in NGN; customerReference is the smart-card/IUC/meter number.",
   inputSchema: z.object({
-    fromAccount: z.string().describe("Customer's debit account number"),
-    billerName: z.string().describe("Biller name (e.g. DSTV, EKEDC, MTN)"),
-    amount: z.number().describe("Amount in NGN"),
+    phone: z.string().describe("Customer's WhatsApp phone number from context"),
+    fromAccount: z.string().optional().describe("Debit account number — omit when the customer has a single linked account"),
+    billerName: z.string().describe("Biller name or code (e.g. DSTV, EKEDC, LAWMA)"),
+    customerReference: z.string().describe("Customer's smart-card / IUC / meter number"),
+    amount: z.number().positive().describe("Amount in NGN"),
+    pin: z.string().describe("4-digit PIN from the customer's most recent message"),
   }),
   outputSchema: z.object({
     success: z.boolean(),
     reference: z.string().optional(),
     message: z.string(),
+    pinRequired: z.boolean().optional(),
+    pinCreationRequired: z.boolean().optional(),
+    pinVerified: z.boolean().optional(),
+    attemptsRemaining: z.number().optional(),
   }),
   execute: async ({
+    phone,
     fromAccount,
     billerName,
+    customerReference,
     amount,
+    pin,
   }: {
-    fromAccount: string;
+    phone: string;
+    fromAccount?: string;
     billerName: string;
+    customerReference: string;
     amount: number;
+    pin: string;
   }) => {
-    const idempotencyKey = `BILL-${Date.now()}-${randomUUID().slice(0, 8).toUpperCase()}`;
-    // pay_bills returns a plain string message from the MCP server
-    const message = await callBankingTool<string>(
-      "pay_bills",
-      { account_number: fromAccount, amount, biller: billerName, idempotency_key: idempotencyKey }
-    );
-    const success = typeof message === "string" && !message.toLowerCase().includes("fail") && !message.toLowerCase().includes("error");
+    // Normalise the biller against the supported list
+    const upper = billerName.toUpperCase().trim();
+    const match = KNOWN_BILLERS.find((b) => upper.includes(b) || b.includes(upper));
+    if (!match) {
+      return { success: false, message: `Biller '${billerName}' is not supported. Supported: DSTV, GOTV, STARTIMES, SHOWMAX, EKEDC, IKEDC, AEDC, PHEDC, IBEDC, EEDC, MTN, AIRTEL, GLO, 9MOBILE, LAWMA.` };
+    }
+
+    const gate = await pinAndAccountGate(phone, fromAccount, pin);
+    if (!gate.ok) {
+      const r = gate.result as any;
+      return {
+        success: false,
+        message: String(r?.error ?? "Bill payment blocked."),
+        pinRequired: r?.pinRequired,
+        pinCreationRequired: r?.pinCreationRequired,
+        pinVerified: r?.pinVerified,
+        attemptsRemaining: r?.attemptsRemaining,
+      };
+    }
+
+    const reference = `BILL-${Date.now()}-${randomUUID().slice(0, 6).toUpperCase()}`;
+    const result = await payMockBill({
+      reference,
+      sourceAccount: gate.accountNumber,
+      sourceBankCode: SOURCE_BANK_CODE,
+      billerCode: match,
+      billerName: match,
+      customerReference,
+      amountKobo: Math.round(amount * 100),
+    });
     return {
-      success,
-      reference: idempotencyKey,
-      message: typeof message === "string" ? message : "Bill payment processed",
+      success: result.success,
+      reference: result.reference,
+      message: result.message ?? (result.success ? "Bill payment successful." : "Bill payment failed."),
     };
   },
 });
 
 // ─── Validate Biller ──────────────────────────────────────────────────────────
-// No dedicated MCP tool for biller validation; use a known-billers allowlist so
-// the agent can confirm the biller exists before calling execute-bill-payment.
+// The external MockBank API takes a free-form billerCode — this allowlist keeps
+// the agent from paying unrecognised billers before execute-bill-payment runs.
 
-const KNOWN_BILLERS = ["DSTV", "GOTV", "STARTIMES", "EKEDC", "IKEDC", "AEDC", "PHEDC",
-  "IBEDC", "EEDC", "MTN", "AIRTEL", "GLO", "9MOBILE", "SHOWMAX",
+const KNOWN_BILLERS = ["DSTV", "GOTV", "STARTIMES", "SHOWMAX", "EKEDC", "IKEDC", "AEDC", "PHEDC",
+  "IBEDC", "EEDC", "JED", "KAEDCO", "MTN", "AIRTEL", "GLO", "9MOBILE",
   "LAWMA", "LAGOS WATER", "ABUJA WATER"];
 
 export const validateBillerTool = createTool({
@@ -648,5 +755,76 @@ export const validateBillerTool = createTool({
       return { valid: false, error: `Biller '${billerName}' is not in the supported billers list.` };
     }
     return { valid: true, normalizedName: match };
+  },
+});
+
+// ─── Airtime Purchase ────────────────────────────────────────────────────────
+
+export const airtimePurchaseTool = createTool({
+  id: "purchase-airtime",
+  description:
+    "Buy airtime top-up for any phone number from the customer's linked account. " +
+    "This tool verifies the customer's transaction PIN internally — always pass 'pin'. " +
+    "Network must be one of MTN, AIRTEL, GLO, 9MOBILE.",
+  inputSchema: z.object({
+    phone: z.string().describe("Customer's WhatsApp phone number from context"),
+    fromAccount: z.string().optional().describe("Debit account number — omit when the customer has a single linked account"),
+    targetPhone: z.string().describe("Phone number to top up (e.g. 09047747474)"),
+    network: z.enum(["MTN", "AIRTEL", "GLO", "9MOBILE"]).describe("Mobile network operator"),
+    amount: z.number().positive().describe("Amount in NGN"),
+    pin: z.string().describe("4-digit PIN from the customer's most recent message"),
+  }),
+  outputSchema: z.object({
+    success: z.boolean(),
+    reference: z.string().optional(),
+    bankReference: z.string().optional(),
+    message: z.string(),
+    pinRequired: z.boolean().optional(),
+    pinCreationRequired: z.boolean().optional(),
+    attemptsRemaining: z.number().optional(),
+  }),
+  execute: async ({
+    phone,
+    fromAccount,
+    targetPhone,
+    network,
+    amount,
+    pin,
+  }: {
+    phone: string;
+    fromAccount?: string;
+    targetPhone: string;
+    network: string;
+    amount: number;
+    pin: string;
+  }) => {
+    const gate = await pinAndAccountGate(phone, fromAccount, pin);
+    if (!gate.ok) {
+      const r = gate.result as GateFailResult;
+      return {
+        success: false,
+        message: r.error,
+        pinRequired: r.pinRequired,
+        pinCreationRequired: r.pinCreationRequired,
+        attemptsRemaining: r.attemptsRemaining,
+      };
+    }
+
+    const reference = `AIR-${Date.now()}-${randomUUID().slice(0, 6).toUpperCase()}`;
+    const result = await purchaseMockAirtime({
+      reference,
+      sourceAccount: gate.accountNumber,
+      sourceBankCode: SOURCE_BANK_CODE,
+      phoneNumber: targetPhone,
+      network,
+      amountKobo: Math.round(amount * 100),
+    });
+
+    return {
+      success: result.success,
+      reference,
+      bankReference: result.bankReference,
+      message: result.message ?? (result.success ? "Airtime purchase successful." : "Airtime purchase failed."),
+    };
   },
 });

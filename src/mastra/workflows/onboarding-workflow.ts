@@ -18,7 +18,8 @@
  */
 import { createWorkflow, createStep } from "@mastra/core/workflows";
 import { z } from "zod";
-import { callBankingTool } from "../core/mcp/banking-mcp-client.js";
+import { lookupCustomerByPhone } from "../../services/local-customer-service.js";
+import { hasAcceptedServiceTerms } from "../../utils/session-state.js";
 import { sendWhatsAppText } from "../../whatsapp-client.js";
 
 const TERMS_PDF_URL =
@@ -44,13 +45,7 @@ const lookupCustomerStep = createStep({
   execute: async ({ inputData }) => {
     const { phone } = inputData;
 
-    const result = await callBankingTool<{
-      found: boolean;
-      customer_id?: number;
-      is_validated?: boolean;
-      has_pin?: boolean;
-      message?: string;
-    }>("lookup_customer_by_phone", { phone_number: phone });
+    const result = await lookupCustomerByPhone(phone);
 
     if (!result.found || !result.customer_id) {
       return {
@@ -101,14 +96,13 @@ const checkOnboardingStep = createStep({
       return { phone, found: false, hasPin: false, termsAccepted: false, phoneVerified: false, isFullyOnboarded: false };
     }
 
-    const result = await callBankingTool<{
-      success: boolean;
-      terms_accepted?: boolean;
-      phone_verified?: boolean;
-    }>("get_onboarding_status", { customer_id: customerId });
-
-    const termsAccepted = result.terms_accepted ?? false;
-    const phoneVerified = result.phone_verified ?? false;
+    // Local onboarding flags — T&C acceptance lives in customer_sessions.context,
+    // phone verification is proven by a linked (externally OTP-verified) account.
+    const [termsAccepted, session] = await Promise.all([
+      hasAcceptedServiceTerms(phone).catch(() => false),
+      lookupCustomerByPhone(phone),
+    ]);
+    const phoneVerified = Boolean(session.account_number);
 
     return {
       phone,
@@ -145,8 +139,7 @@ const sendOnboardingPromptStep = createStep({
     phoneVerified: z.boolean(),
     isFullyOnboarded: z.boolean(),
     /** What prompt action was taken this execution */
-    promptAction: z.enum(["none", "not_registered", "terms_prompt", "otp_sent"]),
-    otpCode: z.string().optional(),
+    promptAction: z.enum(["none", "not_registered", "terms_prompt", "verify_phone_prompt"]),
   }),
   execute: async ({ inputData }) => {
     const { phone, found, customerId, termsAccepted, phoneVerified, isFullyOnboarded, hasPin } = inputData;
@@ -187,34 +180,20 @@ const sendOnboardingPromptStep = createStep({
       return { ...inputData, promptAction: "terms_prompt" as const };
     }
 
-    // Terms accepted but phone not verified — send OTP
+    // Terms accepted but phone not verified — direct the customer to the
+    // Link-Account Meta Flow. Phone verification + OTP is performed by the
+    // EXTERNAL bank API (validateBankAccount issues the OTP reference,
+    // verifyOtp validates it) — we never generate, send, or store OTP codes.
     if (!phoneVerified) {
-      const otpResult = await callBankingTool<{
-        success: boolean;
-        otp_code?: string;
-        message?: string;
-      }>("send_verification_otp", { phone_number: phone });
-
-      if (otpResult.success) {
-        await sendWhatsAppText(
-          phone,
-          `✅ *Terms Accepted — Thank you!*\n\n` +
-            `📱 We've sent a *verification code* to your registered phone number.\n\n` +
-            `Please enter the *4-digit code* to verify your phone number and activate your account.\n\n` +
-            `⏱️ Code is valid for 10 minutes. Do NOT share with anyone.`,
-        );
-        return {
-          ...inputData,
-          promptAction: "otp_sent" as const,
-          otpCode: otpResult.otp_code,
-        };
-      }
-
       await sendWhatsAppText(
         phone,
-        `⚠️ We couldn't send the verification code right now. Please try again in a moment.`,
+        `✅ *Terms Accepted — Thank you!*\n\n` +
+          `🔐 One last step: verify your phone number by linking your bank account.\n\n` +
+          `Tap *Link Bank Account* in the chat, confirm your details, and enter the ` +
+          `*verification code* sent by ${bankName}. Your number is verified automatically.\n\n` +
+          `🔒 For your security, never share verification codes or your PIN with anyone.`,
       );
-      return { ...inputData, promptAction: "otp_sent" as const };
+      return { ...inputData, promptAction: "verify_phone_prompt" as const };
     }
 
     return { ...inputData, promptAction: "none" as const };
@@ -227,7 +206,7 @@ export const onboardingWorkflow = createWorkflow({
   id: "onboarding-workflow",
   description:
     "Gate-check workflow: looks up the customer, checks T&C + phone-verification status, " +
-    "and sends the appropriate prompt (T&C or OTP). " +
+    "and sends the appropriate prompt (T&C acceptance or Link-Account for phone verification). " +
     "Returns the full onboarding state so the calling agent can drive the conversation.",
   inputSchema: z.object({
     phone: z.string().describe("Customer WhatsApp phone number"),
@@ -239,8 +218,7 @@ export const onboardingWorkflow = createWorkflow({
     termsAccepted: z.boolean(),
     phoneVerified: z.boolean(),
     isFullyOnboarded: z.boolean(),
-    promptAction: z.enum(["none", "not_registered", "terms_prompt", "otp_sent"]),
-    otpCode: z.string().optional(),
+    promptAction: z.enum(["none", "not_registered", "terms_prompt", "verify_phone_prompt"]),
   }),
 })
   .then(lookupCustomerStep)

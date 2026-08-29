@@ -116,53 +116,6 @@ export function isOtpValid(state: AgentState, config: AuthorizationConfig = DEFA
 }
 
 /**
- * Verify PIN input against MCP response
- * Returns: { valid: boolean, message: string, attemptsRemaining: number }
- */
-export async function verifyPinWithMcp(
-  state: AgentState,
-  pinInput: string,
-  mcpVerifyResult: any,
-  config: AuthorizationConfig = DEFAULT_CONFIG
-): Promise<{ valid: boolean; message: string; attemptsRemaining: number }> {
-  const auth = getAuthState(state);
-
-  // Validate PIN format
-  if (!pinInput || !/^\d{4}$/.test(pinInput.trim())) {
-    return {
-      valid: false,
-      message: "🔐 PIN must be exactly 4 digits",
-      attemptsRemaining: config.maxPinAttempts - (auth.pinAttempts || 0),
-    };
-  }
-
-  // Check if already exceeded max attempts
-  if ((auth.pinAttempts || 0) >= config.maxPinAttempts) {
-    return {
-      valid: false,
-      message: "🔒 PIN temporarily locked due to too many failed attempts. Please try again later.",
-      attemptsRemaining: 0,
-    };
-  }
-
-  // Check MCP response
-  if (!mcpVerifyResult?.is_valid) {
-    const remaining = config.maxPinAttempts - ((auth.pinAttempts || 0) + 1);
-    return {
-      valid: false,
-      message: `❌ Incorrect PIN. You have ${remaining} attempt(s) remaining.`,
-      attemptsRemaining: remaining,
-    };
-  }
-
-  return {
-    valid: true,
-    message: "✅ PIN verified successfully",
-    attemptsRemaining: config.maxPinAttempts,
-  };
-}
-
-/**
  * Verify OTP input against stored code
  * Returns: { valid: boolean, message: string, attemptsRemaining: number }
  */

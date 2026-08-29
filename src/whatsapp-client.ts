@@ -2,10 +2,10 @@ import "dotenv/config";
 
 const getConfig = () => {
   const apiVersion = process.env.WHATSAPP_API_VERSION || "v22.0";
-  const phoneNumberId = process.env.WHATSAPP_BUSINESS_PHONE_NUMBER_ID;
+  const phoneNumberId = process.env.WHATSAPP_PHONE_ID;
   const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
   if (!phoneNumberId || !accessToken) {
-    throw new Error("Missing WHATSAPP_BUSINESS_PHONE_NUMBER_ID or WHATSAPP_ACCESS_TOKEN");
+    throw new Error("Missing WHATSAPP_PHONE_ID or WHATSAPP_ACCESS_TOKEN");
   }
   return {
     url: `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`,

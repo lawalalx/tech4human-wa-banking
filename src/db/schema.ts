@@ -151,4 +151,62 @@ CREATE TABLE IF NOT EXISTS notification_preferences (
   marketing_opt_in  BOOLEAN NOT NULL DEFAULT false,
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ─── Meta Flow Token Maps ─────────────────────────────────────────────────────
+-- Correlates a Meta Flow token to a customer phone so the webhook can resolve
+-- the sender when the flow is submitted. (senegal pattern)
+CREATE TABLE IF NOT EXISTS meta_flow_token_maps (
+  flow_token     VARCHAR(255) PRIMARY KEY,
+  flow_id        VARCHAR(255) NOT NULL,
+  survey_id      VARCHAR(100),
+  customer_phone VARCHAR(20),
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_flow_token_maps_phone ON meta_flow_token_maps(customer_phone);
+
+-- ─── Meta Flow Responses ─────────────────────────────────────────────────────
+-- Stores the complete form submission from every Meta Flow data_exchange.
+CREATE TABLE IF NOT EXISTS meta_flow_responses (
+  id            BIGSERIAL PRIMARY KEY,
+  flow_id       VARCHAR(255) NOT NULL,
+  flow_token    VARCHAR(255) NOT NULL,
+  customer_phone VARCHAR(20),
+  survey_id     VARCHAR(100),
+  responses     JSONB        NOT NULL DEFAULT '{}',
+  source        VARCHAR(20)  NOT NULL DEFAULT 'data_exchange',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_flow_responses_token ON meta_flow_responses(flow_token);
+CREATE INDEX IF NOT EXISTS idx_flow_responses_phone  ON meta_flow_responses(customer_phone);
+
+-- ─── Verified Customers ─────────────────────────────────────────────────────
+-- Stores banking tokens / details collected via the link-account Meta Flow.
+CREATE TABLE IF NOT EXISTS verified_customers (
+  id            SERIAL PRIMARY KEY,
+  flow_id       VARCHAR(255) NOT NULL,
+  flow_token    VARCHAR(255) NOT NULL,
+  first_name    VARCHAR(100),
+  last_name     VARCHAR(100),
+  account_number VARCHAR(20),
+  bank_code     VARCHAR(10),
+  bank_token    TEXT,
+  phone_number  VARCHAR(20),
+  verified_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_verified_customers_account   ON verified_customers(account_number);
+CREATE INDEX IF NOT EXISTS idx_verified_customers_phone            ON verified_customers(phone_number);
+
+-- ─── Transaction PINs ────────────────────────────────────────────────────────
+-- Local PIN vault for WhatsApp banking transactions. PINs are stored as
+-- scrypt hashes with a per-customer salt (never plaintext).
+CREATE TABLE IF NOT EXISTS customer_pins (
+  phone         VARCHAR(20) PRIMARY KEY,
+  pin_hash      VARCHAR(255) NOT NULL,
+  salt          VARCHAR(64)  NOT NULL,
+  attempts      INTEGER      NOT NULL DEFAULT 0,
+  locked_until  TIMESTAMPTZ,
+  set_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
 `;
